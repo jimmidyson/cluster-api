@@ -13,7 +13,7 @@ require (
 	github.com/fatih/color v1.7.0
 	github.com/go-logr/logr v0.4.0
 	github.com/gobuffalo/flect v0.2.2
-	github.com/google/go-cmp v0.5.2
+	github.com/google/go-cmp v0.5.9
 	github.com/google/go-github v17.0.0+incompatible
 	github.com/google/go-querystring v1.0.0 // indirect
 	github.com/google/gofuzz v1.2.0
@@ -25,8 +25,8 @@ require (
 	github.com/spf13/pflag v1.0.5
 	github.com/spf13/viper v1.7.0
 	go.etcd.io/etcd v0.5.0-alpha.5.0.20200910180754-dd1b699fc489
-	golang.org/x/oauth2 v0.0.0-20200107190931-bf48bf16ab8d
-	google.golang.org/grpc v1.27.1
+	golang.org/x/oauth2 v0.4.0
+	google.golang.org/grpc v1.53.0
 	k8s.io/api v0.21.0-beta.0
 	k8s.io/apiextensions-apiserver v0.21.0-beta.0
 	k8s.io/apimachinery v0.21.0-beta.0
