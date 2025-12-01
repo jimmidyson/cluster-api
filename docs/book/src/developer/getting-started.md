@@ -83,7 +83,7 @@ The generated binary can be found at ./hack/tools/bin/envsubst
 You'll need to deploy [cert-manager] components on your [management cluster][mcluster], using `kubectl`
 
 ```bash
-kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.18.1/cert-manager.yaml
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.19.1/cert-manager.yaml
 ```
 
 Ensure the cert-manager webhook service is ready before creating the Cluster API components.
@@ -167,12 +167,10 @@ To test another iteration, you'll need to follow the steps to build, push, updat
 
 **Tutorials**
 
-* [kubectl Create Cluster: Production-ready Kubernetes with Cluster API 1.0 - October 2022](https://kccncna2022.sched.com/event/1BZDs)
+* [kubectl Create Cluster: Production-ready Kubernetes with Cluster API 1.0 - October 2022](https://www.youtube.com/watch?v=7wdVPuf-gXI)
 
   [Source code](https://github.com/ykakarap/kubecon-na-22-capi-lab)
-* [So You Want To Develop a Cluster API Provider? - October 2022](https://kccncna2022.sched.com/event/182Ha)
-
-  [Source code](https://capi-samples.github.io/kubecon-na-2022-tutorial/)
+* [So You Want To Develop a Cluster API Provider? - October 2022](https://www.youtube.com/watch?v=5-X6haLVO5A)
 
 **Code walkthroughs**
 
