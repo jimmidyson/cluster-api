@@ -167,10 +167,49 @@ func GetContractVersionForVersion(ctx context.Context, c client.Reader, gk schem
 	return "", pkgerrors.Errorf("cannot find any contract version matching version %s for CRD %s", version, crdMetadata.GetName())
 }
 
+// GKMetadataGetter resolves the metadata carrying contract-version labels for a GroupKind.
+type GKMetadataGetter func(ctx context.Context, c client.Reader, gk schema.GroupKind) (*metav1.PartialObjectMetadata, error)
+
+// gkMetadataGetter is the resolver GetGKMetadata delegates to. It defaults to
+// getGKMetadataFromCRD, which reads the CustomResourceDefinition object.
+//
+// It is overridable because a CustomResourceDefinition object is not the
+// source of truth in every environment. Where a type is served through an
+// aggregation or binding mechanism rather than by hosting its CRD, no such
+// object exists to read, and every contract-versioned reference resolution
+// fails. Every such lookup funnels through GetGKMetadata, so overriding here
+// covers GetContractVersion, GetAPIVersion and
+// external.GetObjectFromContractVersionedRef uniformly rather than needing a
+// hook at each call site.
+//
+// Set it through external.SetGKMetadataGetter; this package is internal.
+var gkMetadataGetter GKMetadataGetter = getGKMetadataFromCRD
+
+// SetGKMetadataGetter overrides how GetGKMetadata resolves metadata for a
+// GroupKind. Passing nil restores the default CustomResourceDefinition lookup.
+//
+// This mirrors the SetAPIVersionGetter escape hatch already present in
+// core/webhooks/conversion, which solves the same problem for the conversion
+// webhook's own call path.
+func SetGKMetadataGetter(f GKMetadataGetter) {
+	if f == nil {
+		gkMetadataGetter = getGKMetadataFromCRD
+		return
+	}
+	gkMetadataGetter = f
+}
+
 // GetGKMetadata retrieves a CustomResourceDefinition metadata from the API server using partial object metadata.
 //
 // This function is greatly more efficient than GetCRDWithContract and should be preferred in most cases.
 func GetGKMetadata(ctx context.Context, c client.Reader, gk schema.GroupKind) (*metav1.PartialObjectMetadata, error) {
+	return gkMetadataGetter(ctx, c, gk)
+}
+
+// getGKMetadataFromCRD is the default GKMetadataGetter: it reads the
+// CustomResourceDefinition object for the GroupKind. This is GetGKMetadata's
+// original behaviour, unchanged.
+func getGKMetadataFromCRD(ctx context.Context, c client.Reader, gk schema.GroupKind) (*metav1.PartialObjectMetadata, error) {
 	meta := &metav1.PartialObjectMetadata{}
 	meta.SetName(contract.CalculateCRDName(gk.Group, gk.Kind))
 	meta.SetGroupVersionKind(apiextensionsv1.SchemeGroupVersion.WithKind("CustomResourceDefinition"))
