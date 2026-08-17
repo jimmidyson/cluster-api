@@ -27,7 +27,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
-	mccontroller "sigs.k8s.io/multicluster-runtime/pkg/controller"
 	mchandler "sigs.k8s.io/multicluster-runtime/pkg/handler"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 	mcsource "sigs.k8s.io/multicluster-runtime/pkg/source"
@@ -66,20 +65,22 @@ import (
 // constructor to supply one. The single-cluster ObjectTracker is therefore
 // untouched.
 //
-// # Not yet reachable from the builder
+// # Wiring
 //
-// MultiClusterWatch is on multicluster-runtime's controller interface, and
-// MulticlusterBuilder.Build currently returns ControllerFor, which embeds only
-// controller-runtime's. Surfacing the multicluster controller from Build is the
-// next step, and until it is done this type compiles but cannot be wired to a
-// controller the builder produced.
+// MulticlusterBuilder.Build returns a MulticlusterController, which satisfies
+// MultiClusterWatcher — so the controller a reconciler's setup function builds
+// is what goes in the Controller field here.
 type MulticlusterObjectTracker struct {
 	m sync.Map
 
-	// Controller is the multicluster controller, not controller-runtime's.
-	// Registering a fleet-wide watch needs MultiClusterWatch, which applies the
-	// source to every engaged cluster and to any that engage later.
-	Controller mccontroller.TypedController[mcreconcile.Request]
+	// Controller is anything that can register a fleet-wide watch — in practice
+	// what MulticlusterBuilder.Build returns.
+	//
+	// Narrowed to the single method this uses rather than taking the whole
+	// controller interface: it keeps the dependency honest about what a tracker
+	// actually needs, and it avoids this package having to name a type from the
+	// builder package it does not otherwise depend on.
+	Controller MultiClusterWatcher
 
 	// No Cache field, unlike ObjectTracker. A multicluster source resolves each
 	// cluster's cache itself when the controller engages that cluster, so there
@@ -87,6 +88,16 @@ type MulticlusterObjectTracker struct {
 	// cluster's watch to one cluster's informers.
 	Scheme          *runtime.Scheme
 	PredicateLogger *logr.Logger
+}
+
+// MultiClusterWatcher registers a source with every cluster a controller
+// serves, including clusters that engage after registration.
+//
+// controller-runtime's Watch cannot express that: it binds a source to one
+// cache. A watch added at runtime — which is what this tracker exists for —
+// must reach clusters that were not engaged when it was added.
+type MultiClusterWatcher interface {
+	MultiClusterWatch(src mcsource.TypedSource[client.Object, mcreconcile.Request]) error
 }
 
 // Watch adds a watch for an external object, if one is not already registered

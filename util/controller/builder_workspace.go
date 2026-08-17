@@ -35,14 +35,47 @@ import (
 
 	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
 	mccontext "sigs.k8s.io/multicluster-runtime/pkg/context"
+	mccontroller "sigs.k8s.io/multicluster-runtime/pkg/controller"
 	mchandler "sigs.k8s.io/multicluster-runtime/pkg/handler"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
+	mcsource "sigs.k8s.io/multicluster-runtime/pkg/source"
 
 	"sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/cluster-api/util/cache"
 	predicatesutil "sigs.k8s.io/cluster-api/util/predicates"
 )
+
+// MulticlusterController is what MulticlusterBuilder produces: everything a
+// single-cluster Controller offers, plus the fleet-wide watch registration.
+//
+// MultiClusterWatch is the addition, and it is not cosmetic. Watches added at
+// runtime — the contract-versioned references both core reconcilers resolve —
+// have to reach every cluster the controller serves, including ones that engage
+// after the watch is registered. controller-runtime's Watch registers against
+// one cache and cannot do that.
+type MulticlusterController interface {
+	ControllerFor[mcreconcile.Request]
+
+	// MultiClusterWatch registers a source with every engaged cluster, and with
+	// any that engage later.
+	MultiClusterWatch(src mcsource.TypedSource[client.Object, mcreconcile.Request]) error
+}
+
+// multiclusterController joins the shared wrapper — which carries the reconcile
+// cache, the deferral methods and the consistency store — to the multicluster
+// controller underneath it.
+//
+// Embedded rather than reimplemented: everything except MultiClusterWatch is
+// the same code the single-cluster builder uses, so the two cannot drift.
+type multiclusterController struct {
+	*controllerWrapper[mcreconcile.Request]
+	mc mccontroller.TypedController[mcreconcile.Request]
+}
+
+func (c *multiclusterController) MultiClusterWatch(src mcsource.TypedSource[client.Object, mcreconcile.Request]) error {
+	return c.mc.MultiClusterWatch(src)
+}
 
 // MulticlusterBuilder builds one controller that serves every cluster a
 // multicluster-runtime provider offers, rather than one controller per cluster.
@@ -167,7 +200,7 @@ func (blder *MulticlusterBuilder) Complete(ctx context.Context, r reconcile.Reco
 // adapted, not rewritten: ReconcilerWithClusterInContext unwraps the
 // multicluster request, puts its cluster in the context, and calls Reconcile
 // with the plain request the reconciler already expects.
-func (blder *MulticlusterBuilder) Build(ctx context.Context, r reconcile.Reconciler) (ControllerFor[mcreconcile.Request], error) {
+func (blder *MulticlusterBuilder) Build(ctx context.Context, r reconcile.Reconciler) (MulticlusterController, error) {
 	if feature.Gates.Enabled(feature.ReconcilerRateLimiting) && !feature.Gates.Enabled(feature.PriorityQueue) {
 		return nil, pkgerrors.New("if feature gate ReconcilerRateLimiting is enabled, feature gate PriorityQueue must be enabled as well")
 	}
@@ -264,19 +297,22 @@ func (blder *MulticlusterBuilder) Build(ctx context.Context, r reconcile.Reconci
 	reconcileTotal.WithLabelValues(controllerName, labelRequeue).Add(0)
 	reconcileTotal.WithLabelValues(controllerName, labelSuccess).Add(0)
 
-	return &controllerWrapper[mcreconcile.Request]{
-		TypedController:  c,
-		reconcileCache:   reconcileCache,
-		consistencyStore: consistencyStore,
-		// DeferNextReconcileForObject is called from inside Reconcile with only
-		// an object, so there is no cluster to attach here. The resulting
-		// request therefore defers the object in *every* cluster.
-		//
-		// Harmless for the controllers converted first, which never call it,
-		// and a correctness hazard for any that do — recorded alongside the
-		// consistency store constraint above.
-		newRequest: func(nn types.NamespacedName) mcreconcile.Request {
-			return mcreconcile.Request{Request: reconcile.Request{NamespacedName: nn}}
+	return &multiclusterController{
+		mc: c,
+		controllerWrapper: &controllerWrapper[mcreconcile.Request]{
+			TypedController:  c,
+			reconcileCache:   reconcileCache,
+			consistencyStore: consistencyStore,
+			// DeferNextReconcileForObject is called from inside Reconcile with only
+			// an object, so there is no cluster to attach here. The resulting
+			// request therefore defers the object in *every* cluster.
+			//
+			// Harmless for the controllers converted first, which never call it,
+			// and a correctness hazard for any that do — recorded alongside the
+			// consistency store constraint above.
+			newRequest: func(nn types.NamespacedName) mcreconcile.Request {
+				return mcreconcile.Request{Request: reconcile.Request{NamespacedName: nn}}
+			},
 		},
 	}, nil
 }
