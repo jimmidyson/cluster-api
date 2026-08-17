@@ -32,17 +32,18 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	mcbuilder "sigs.k8s.io/multicluster-runtime/pkg/builder"
 	mccontext "sigs.k8s.io/multicluster-runtime/pkg/context"
 	mccontroller "sigs.k8s.io/multicluster-runtime/pkg/controller"
-	mchandler "sigs.k8s.io/multicluster-runtime/pkg/handler"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 	mcsource "sigs.k8s.io/multicluster-runtime/pkg/source"
 
 	"sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/cluster-api/util/cache"
+	capimulticluster "sigs.k8s.io/cluster-api/util/multicluster"
 	predicatesutil "sigs.k8s.io/cluster-api/util/predicates"
 )
 
@@ -148,16 +149,29 @@ func (blder *MulticlusterBuilder) Owns(object client.Object, predicates ...predi
 //
 // The handler is an ordinary single-cluster handler — exactly what the
 // reconcilers already construct — and is lifted here rather than at the call
-// site. mchandler.TypedLift wraps it so the requests it enqueues carry the
-// cluster the event came from, which is what keeps two clusters' identically
-// named objects apart in the queue.
+// site. LiftWithClusterInContext wraps it so that the requests it enqueues carry
+// the cluster the event came from, which keeps two clusters' identically named
+// objects apart in the queue, and so that the context it runs in carries that
+// cluster too, which is what lets its map function list within the right one.
 //
 // That is what allows a reconciler's existing map functions to be reused
-// verbatim: they still produce plain reconcile.Requests, and the lift attaches
-// the cluster around them.
+// verbatim: they still produce plain reconcile.Requests against a plain client,
+// and the lift supplies the cluster around both.
 func (blder *MulticlusterBuilder) Watches(object client.Object, eventHandler handler.TypedEventHandler[client.Object, reconcile.Request], predicates ...predicate.Predicate) *MulticlusterBuilder {
 	predicates = append([]predicate.Predicate{predicatesutil.ResourceIsChanged(blder.mgr.GetLocalManager().GetScheme(), blder.predicateLog)}, predicates...)
-	blder.builder.Watches(object, mchandler.TypedLift(eventHandler), mcbuilder.WithPredicates(predicates...))
+	blder.builder.Watches(object, capimulticluster.LiftWithClusterInContext(eventHandler), mcbuilder.WithPredicates(predicates...))
+	return blder
+}
+
+// WatchesRawSource adds a source already keyed on mcreconcile.Request.
+//
+// Unlike Watches, nothing is lifted: a raw source is registered against the
+// controller rather than per cluster, so it is the source's own business to set
+// the cluster on what it enqueues. See
+// clustercache.MulticlusterClusterSourceFunc for the one the core reconcilers
+// need.
+func (blder *MulticlusterBuilder) WatchesRawSource(src source.TypedSource[mcreconcile.Request]) *MulticlusterBuilder {
+	blder.builder.WatchesRawSource(src)
 	return blder
 }
 

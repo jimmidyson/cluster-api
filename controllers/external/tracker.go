@@ -30,10 +30,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
-	mchandler "sigs.k8s.io/multicluster-runtime/pkg/handler"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 	mcsource "sigs.k8s.io/multicluster-runtime/pkg/source"
 
+	capimulticluster "sigs.k8s.io/cluster-api/util/multicluster"
 	"sigs.k8s.io/cluster-api/util/predicates"
 )
 
@@ -100,13 +100,14 @@ func (o *ObjectTracker) Watch(log logr.Logger, obj client.Object, handler handle
 
 	var err error
 	if o.MultiClusterController != nil {
-		// mchandler.Lift produces a handler *factory* keyed by cluster rather
-		// than a handler, because a multicluster source builds one handler per
-		// engaged cluster. That is why this cannot go through source.Kind: there
-		// is no single cluster to build the handler for at registration time.
+		// LiftWithClusterInContext produces a handler *factory* keyed by cluster
+		// rather than a handler, because a multicluster source builds one
+		// handler per engaged cluster. That is why this cannot go through
+		// source.Kind: there is no single cluster to build the handler for at
+		// registration time.
 		err = o.MultiClusterController.MultiClusterWatch(mcsource.TypedKind(
 			obj.DeepCopyObject().(client.Object),
-			mchandler.Lift(handler),
+			capimulticluster.LiftWithClusterInContext(handler),
 			preds...,
 		))
 	} else {
