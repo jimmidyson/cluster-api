@@ -183,6 +183,8 @@ type wildcardWatch struct {
 // is a single object, which is the wrong shape for a provider whose clusters are
 // views over one cache.
 //
+// With this on, the same measurement is 8.1 goroutines per workspace.
+//
 // # What the caller has to know
 //
 // Two things Cluster API cannot work out for itself. The cache must span
@@ -392,6 +394,37 @@ func (blder *MulticlusterBuilder) Build(ctx context.Context, r reconcile.Reconci
 
 	blder.builder.WithOptions(blder.options)
 
+	// Wildcard watches become raw sources on the underlying builder.
+	//
+	// Raw is the right category and not a workaround: a raw source is one the
+	// builder registers with the controller as given, rather than binding to
+	// each cluster as it engages — which is exactly what a single registration
+	// across a fleet-spanning cache is. It also means the builder still sees
+	// watches, so its "no watches configured" check keeps working.
+	if blder.wildcard != nil {
+		// The underlying builder derives the controller name from For(), which
+		// wildcard mode does not give it. The name computed above is the same
+		// one it would have derived, so this only tells it what it already would
+		// have known.
+		blder.builder.Named(controllerName)
+	}
+	for _, w := range blder.wildcardWatches {
+		h := w.handler
+		if w.owner {
+			if blder.forObject == nil {
+				return nil, pkgerrors.New("Owns() can only be used together with For()")
+			}
+			h = handler.EnqueueRequestForOwner(localMgr.GetScheme(), localMgr.GetRESTMapper(), blder.forObject)
+		}
+		preds := w.predicates
+		if blder.globalPredicate != nil {
+			// Prepended, so a global filter cannot be overridden by a
+			// watch-specific one that happens to come first.
+			preds = append([]predicate.Predicate{blder.globalPredicate}, preds...)
+		}
+		blder.builder.WatchesRawSource(capimulticluster.WildcardSource(blder.wildcard, w.object, h, blder.clusterOf, preds...))
+	}
+
 	reconcileCache := cache.New[reconcileCacheEntry[mcreconcile.Request]](ctx, cache.DefaultTTL)
 
 	// The consistency store is the local manager's.
@@ -442,27 +475,6 @@ func (blder *MulticlusterBuilder) Build(ctx context.Context, r reconcile.Reconci
 				return mcreconcile.Request{Request: reconcile.Request{NamespacedName: nn}}
 			},
 		},
-	}
-
-	// Wildcard watches are registered here rather than through the multicluster
-	// builder, because the builder's job is to bind a source to each cluster as
-	// it engages and these deliberately bind to none: one registration on the
-	// shared cache serves the fleet.
-	for _, w := range blder.wildcardWatches {
-		h := w.handler
-		if w.owner {
-			if blder.forObject == nil {
-				return nil, pkgerrors.New("Owns() can only be used together with For()")
-			}
-			h = handler.EnqueueRequestForOwner(localMgr.GetScheme(), localMgr.GetRESTMapper(), blder.forObject)
-		}
-		preds := w.predicates
-		if blder.globalPredicate != nil {
-			preds = append([]predicate.Predicate{blder.globalPredicate}, preds...)
-		}
-		if err := c.Watch(capimulticluster.WildcardSource(blder.wildcard, w.object, h, blder.clusterOf, preds...)); err != nil {
-			return nil, pkgerrors.Wrapf(err, "registering a fleet-wide watch on %T", w.object)
-		}
 	}
 
 	reconcileTotal.WithLabelValues(controllerName, labelError).Add(0)
