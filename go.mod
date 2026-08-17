@@ -1,6 +1,6 @@
 module sigs.k8s.io/cluster-api
 
-go 1.26.0
+go 1.26.3
 
 replace sigs.k8s.io/cluster-api/api => ./api
 
@@ -60,6 +60,8 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.4.2
 	sigs.k8s.io/yaml v1.6.0
 )
+
+require sigs.k8s.io/multicluster-runtime v0.24.1
 
 require (
 	cel.dev/expr v0.25.1 // indirect

@@ -146,10 +146,18 @@ func (blder *Builder) Named(name string) *Builder {
 	return blder
 }
 
-// Controller is the controller-runtime Controller interface with
-// additional methods to defer the next reconcile for a request / object.
-type Controller interface {
-	controller.Controller
+// ControllerFor is the controller-runtime Controller interface with additional
+// methods to defer the next reconcile for a request / object, parameterised on
+// the type the controller's queue is keyed by.
+//
+// The parameter exists so that a controller serving many clusters — whose queue
+// is keyed on a request carrying the cluster — presents the same surface as one
+// serving a single cluster. Everything below the embedded interface is
+// deliberately typed on the plain reconcile.Request regardless: these methods
+// are called from inside Reconcile, and parameterising them would change
+// reconciler code rather than wiring.
+type ControllerFor[request RequestType] interface {
+	controller.TypedController[request]
 	DeferNextReconcile(req reconcile.Request, reconcileAfter time.Time)
 	DeferNextReconcileForObject(obj metav1.Object, reconcileAfter time.Time)
 
@@ -161,6 +169,13 @@ type Controller interface {
 	// ClearConsistencyStore clears the consistency store for a reconciledObject.
 	ClearConsistencyStore(reconciledObject client.ObjectKey, reconciledObjectUID types.UID)
 }
+
+// Controller is ControllerFor a single-cluster controller.
+//
+// An alias rather than a distinct interface, so every existing declaration of
+// this type — including the `controller` field on the reconcilers — keeps
+// compiling and keeps meaning exactly what it meant before.
+type Controller = ControllerFor[reconcile.Request]
 
 // Complete builds the Application Controller.
 func (blder *Builder) Complete(ctx context.Context, r reconcile.TypedReconciler[reconcile.Request]) error {
