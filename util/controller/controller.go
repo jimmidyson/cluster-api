@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	pkgerrors "github.com/pkg/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -89,6 +90,15 @@ func (r *reconcilerWrapper[request]) Reconcile(ctx context.Context, req request)
 		if requeueAfter, requeue := cacheEntry.ShouldRequeue(reconcileStartTime); requeue {
 			return ctrl.Result{RequeueAfter: requeueAfter}, nil
 		}
+	}
+
+	// Guarded rather than called blind. This is a required field on a struct
+	// that is built as a literal, so omitting it is a compile-time silence and
+	// a run-time nil dereference deep inside Reconcile — which is exactly how
+	// it was first found. A named error says what is wrong at the first
+	// reconcile instead.
+	if r.namespacedName == nil {
+		return ctrl.Result{}, pkgerrors.New("reconcilerWrapper.namespacedName must be set: it extracts the object identity the consistency store is keyed by")
 	}
 
 	consistencyErrs, err := r.consistencyStore.EnsureReady(ctx, r.namespacedName(req))
@@ -182,6 +192,12 @@ type controllerWrapper[request RequestType] struct {
 // applies to the object in every cluster; see the note where newRequest is
 // supplied.
 func (c *controllerWrapper[request]) DeferNextReconcile(req reconcile.Request, reconcileAfter time.Time) {
+	// Same reasoning as reconcilerWrapper.namespacedName: a required field on a
+	// struct built as a literal. Dropping the deferral is wrong, so this is
+	// loud rather than silent.
+	if c.newRequest == nil {
+		panic("controllerWrapper.newRequest must be set: it builds the queue item a deferral is recorded against")
+	}
 	c.reconcileCache.Add(reconcileCacheEntry[request]{
 		Request:        c.newRequest(req.NamespacedName),
 		ReconcileAfter: reconcileAfter,
