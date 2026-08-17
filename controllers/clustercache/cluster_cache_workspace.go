@@ -88,7 +88,7 @@ func keyFor(ctx context.Context, cluster client.ObjectKey) accessorKey {
 // Options.SecretClient must resolve the logical cluster from the context too —
 // it reads each Cluster's kubeconfig Secret, and reading the wrong workspace's
 // is how a workload cluster gets handed to the wrong tenant.
-func SetupWithMulticlusterManager(ctx context.Context, mgr mcmanager.Manager, cl client.Client, options Options, controllerOptions controller.TypedOptions[mcreconcile.Request]) (ClusterCache, error) {
+func SetupWithMulticlusterManager(ctx context.Context, mgr mcmanager.Manager, cl client.Client, options Options, controllerOptions controller.TypedOptions[mcreconcile.Request]) (MulticlusterClusterCache, error) {
 	log := ctrl.LoggerFrom(ctx).WithValues("controller", "clustercache")
 
 	if cl == nil {
@@ -233,6 +233,21 @@ func controllerPodMetadata(log logr.Logger) *metav1.ObjectMeta {
 		Name:      podName,
 		UID:       types.UID(podUID),
 	}
+}
+
+// MulticlusterClusterCache is a ClusterCache that also serves fleet-wide
+// Cluster-event sources.
+//
+// Separate from ClusterCache rather than folded into it: a ClusterCache built by
+// SetupWithManager cannot serve one — its consumers are keyed on a request that
+// carries no cluster — so putting the method on the base interface would promise
+// something one of the two constructions cannot keep.
+type MulticlusterClusterCache interface {
+	ClusterCache
+
+	// GetMulticlusterClusterSource returns a Source of Cluster events whose
+	// requests carry the logical cluster the Cluster lives in.
+	GetMulticlusterClusterSource(controllerName string, mapFunc func(ctx context.Context, cluster client.Object) []ctrl.Request, opts ...GetClusterSourceOption) source.TypedSource[mcreconcile.Request]
 }
 
 // MulticlusterClusterSourceFunc is the shape of GetMulticlusterClusterSource.
