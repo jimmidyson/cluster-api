@@ -192,7 +192,8 @@ type wildcardWatch struct {
 // is a single object, which is the wrong shape for a provider whose clusters are
 // views over one cache.
 //
-// With this on, the same measurement is 5.1 goroutines per workspace.
+// With this on, and with engagement dropped, the same measurement is 2.0
+// goroutines per workspace — flat across six doublings to a hundred.
 //
 // # What the caller has to know
 //
@@ -221,8 +222,9 @@ func (blder *MulticlusterBuilder) WithWildcardCache(c crcache.Cache, clusterOf c
 // per workspace that remained after the watches were fixed: one per controller
 // per engaged cluster, doing nothing for a controller with nothing to engage.
 //
-// A controller that never engages does not pay it: 8.1 becomes 5.1, and the
-// group disappears from the profile. Nothing is lost, because the
+// A controller that never engages does not pay it: the group disappears from
+// the profile, and what a workspace costs settles at exactly two goroutines
+// across a sweep to a hundred — one of which is the provider's, not this. Nothing is lost, because the
 // two things engagement provides are not used here: the per-cluster sources do
 // not exist, and cluster resolution happens through the manager on the reconcile
 // path, which never consulted the controller's map.

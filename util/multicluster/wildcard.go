@@ -70,10 +70,11 @@ type ClusterResolver func(client.Object) (mcmulticluster.ClusterName, bool)
 // per-workspace registration cost becomes zero, and the per-type cost is what it
 // always was.
 //
-// Measured on the same wiring afterwards: 8.1 goroutines per workspace against
-// 51.7, and ten informer listeners for the whole shard against 73 and climbing.
-// Dropping the per-cluster engagement this makes unnecessary takes it to 5.1;
-// see MulticlusterBuilder.buildWildcard.
+// Measured on the same wiring afterwards, swept to a hundred workspaces: ten
+// informer listeners for the whole shard, where per-cluster registration would
+// have been about nine hundred. With the per-cluster engagement this makes
+// unnecessary also dropped (see MulticlusterBuilder.buildWildcard), a workspace
+// costs exactly two goroutines, against 51.7 before either change.
 //
 // # What it gives the handler
 //
