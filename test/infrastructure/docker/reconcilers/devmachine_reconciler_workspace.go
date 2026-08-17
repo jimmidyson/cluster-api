@@ -65,6 +65,7 @@ func (r *DevMachine) SetupWithMulticlusterManager(
 	mgr mcmanager.Manager,
 	options controller.TypedOptions[mcreconcile.Request],
 	clusterSource clustercache.MulticlusterClusterSourceFunc,
+	opts ...capicontrollerutil.MulticlusterOption,
 ) error {
 	if r.Client == nil || r.InMemoryManager == nil || r.APIServerMux == nil || r.ContainerRuntime == nil || r.ClusterCache == nil {
 		return pkgerrors.New("Client, InMemoryManager and APIServerMux, ContainerRuntime and ClusterCache must not be nil")
@@ -82,6 +83,7 @@ func (r *DevMachine) SetupWithMulticlusterManager(
 
 	r.DockerMachineTaskManager = dockerbackend.NewTaskManager()
 	c, err := capicontrollerutil.NewMulticlusterControllerManagedBy(mgr, predicateLog).
+		Apply(opts...).
 		For(&infrav1.DevMachine{}).
 		WithOptions(options).
 		WithEventFilter(predicates.ResourceHasFilterLabel(scheme, predicateLog, r.WatchFilterValue)).

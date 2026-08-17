@@ -51,7 +51,7 @@ import (
 // provider, which exists for development and e2e; it predates this setup and is
 // not introduced by it. A real infrastructure provider holds nothing
 // process-wide.
-func (r *DevCluster) SetupWithMulticlusterManager(ctx context.Context, mgr mcmanager.Manager, options controller.TypedOptions[mcreconcile.Request]) error {
+func (r *DevCluster) SetupWithMulticlusterManager(ctx context.Context, mgr mcmanager.Manager, options controller.TypedOptions[mcreconcile.Request], opts ...capicontrollerutil.MulticlusterOption) error {
 	if r.Client == nil || r.InMemoryManager == nil || r.APIServerMux == nil || r.ContainerRuntime == nil {
 		return pkgerrors.New("Client, InMemoryManager and APIServerMux, ContainerRuntime must not be nil")
 	}
@@ -59,6 +59,7 @@ func (r *DevCluster) SetupWithMulticlusterManager(ctx context.Context, mgr mcman
 	scheme := mgr.GetLocalManager().GetScheme()
 	predicateLog := ctrl.LoggerFrom(ctx).WithValues("controller", "devcluster")
 	err := capicontrollerutil.NewMulticlusterControllerManagedBy(mgr, predicateLog).
+		Apply(opts...).
 		For(&infrav1.DevCluster{}).
 		WithOptions(options).
 		WithEventFilter(predicates.ResourceHasFilterLabel(scheme, predicateLog, r.WatchFilterValue)).
