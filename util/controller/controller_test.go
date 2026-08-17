@@ -64,6 +64,7 @@ func TestReconcile(t *testing.T) {
 
 		var reconcileCounter atomic.Int64
 		r := &reconcilerWrapper[reconcile.Request]{
+			namespacedName: func(req reconcile.Request) types.NamespacedName { return req.NamespacedName },
 			name:           "cluster",
 			reconcileCache: reconcileCache,
 			reconciler: reconcile.Func(func(_ context.Context, _ reconcile.Request) (reconcile.Result, error) {
@@ -75,6 +76,7 @@ func TestReconcile(t *testing.T) {
 			consistencyStore:  consistencyStore,
 		}
 		c := controllerWrapper[reconcile.Request]{
+			newRequest:     func(nn types.NamespacedName) reconcile.Request { return reconcile.Request{NamespacedName: nn} },
 			reconcileCache: reconcileCache,
 		}
 
@@ -291,6 +293,7 @@ func TestReconcileMetrics(t *testing.T) {
 		rateLimitInterval := 1 * time.Second
 
 		r := reconcilerWrapper[reconcile.Request]{
+			namespacedName:    func(req reconcile.Request) types.NamespacedName { return req.NamespacedName },
 			name:              "cluster",
 			reconcileCache:    reconcileCache,
 			rateLimitInterval: rateLimitInterval,
