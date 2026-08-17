@@ -1318,6 +1318,7 @@ func TestMachineV1Beta1Conditions(t *testing.T) {
 					PredicateLogger: ptr.To(logr.New(log.NullLogSink{})),
 				},
 				controller:                  &fakeController{},
+				newNodeWatcher:              singleClusterNodeWatcher(&fakeController{}),
 				predicateLog:                ptr.To(logr.New(log.NullLogSink{})),
 				RemoteConditionsGracePeriod: 50 * time.Second,
 			}
