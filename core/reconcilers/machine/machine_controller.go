@@ -92,6 +92,58 @@ var (
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=machinedrainrules,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
+// machineController is the part of the built controller the reconcile path uses.
+//
+// Narrowed from capicontrollerutil.Controller so that the same field can hold
+// either the single-cluster controller or the fleet-wide one. Those differ in
+// their request type — reconcile.Request against mcreconcile.Request — and so
+// have no common interface beyond the methods that do not mention it. This is
+// the only such method the reconcile path calls.
+type machineController interface {
+	DeferNextReconcileForObject(obj metav1.Object, reconcileAfter time.Time)
+}
+
+// nodeWatcherFunc builds the watch this reconciler establishes on a workload
+// cluster's Nodes.
+//
+// # Why this is a seam rather than a straight call
+//
+// clustercache.NewWatcher is keyed on the request type of the controller that
+// will receive the events, and the two setups differ there. The fleet-wide one
+// additionally has to say which management cluster the events belong to — the
+// Nodes come from a workload cluster, and the Machines they map to live in
+// whichever cluster is being reconciled — so it needs the context, which is why
+// this takes one.
+//
+// The reconcile path stays as it was: it names a watch, a kind, a handler and
+// predicates, and does not know which shape of controller will serve them.
+type nodeWatcherFunc func(
+	ctx context.Context,
+	name string,
+	kind client.Object,
+	eventHandler handler.EventHandler,
+	predicates ...predicate.TypedPredicate[client.Object],
+) (clustercache.Watcher, error)
+
+// singleClusterNodeWatcher is the nodeWatcherFunc for a controller that serves
+// one cluster: the watch clustercache.NewWatcher has always built, with the
+// arguments now arriving through the seam instead of being written inline.
+//
+// It is a named function rather than a literal inside SetupWithManager so that
+// tests constructing a Reconciler directly can install the same thing, which is
+// what the reconcile path expects to find there.
+func singleClusterNodeWatcher(c clustercache.SourceWatcher[ctrl.Request]) nodeWatcherFunc {
+	return func(_ context.Context, name string, kind client.Object, eventHandler handler.EventHandler, preds ...predicate.TypedPredicate[client.Object]) (clustercache.Watcher, error) {
+		return clustercache.NewWatcher(clustercache.WatcherOptions{
+			Name:         name,
+			Watcher:      c,
+			Kind:         kind,
+			EventHandler: eventHandler,
+			Predicates:   preds,
+		}), nil
+	}
+}
+
 // Reconciler reconciles a Machine object.
 type Reconciler struct {
 	Client        client.Client
@@ -107,7 +159,8 @@ type Reconciler struct {
 	AdditionalSyncMachineLabels      []*regexp.Regexp
 	AdditionalSyncMachineAnnotations []*regexp.Regexp
 
-	controller      capicontrollerutil.Controller
+	controller      machineController
+	newNodeWatcher  nodeWatcherFunc
 	recorder        record.EventRecorder
 	externalTracker external.ObjectTracker
 
@@ -178,6 +231,7 @@ func (r *Reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, opt
 
 	r.hookCache = cache.New[cache.HookEntry](ctx, cache.HookCacheDefaultTTL)
 	r.controller = c
+	r.newNodeWatcher = singleClusterNodeWatcher(c)
 	r.recorder = mgr.GetEventRecorderFor("machine-controller")
 	r.externalTracker = external.ObjectTracker{
 		Controller:      c,
@@ -1114,13 +1168,21 @@ func (r *Reconciler) watchClusterNodes(ctx context.Context, cluster *clusterv1.C
 		return nil
 	}
 
-	return r.ClusterCache.Watch(ctx, util.ObjectKey(cluster), clustercache.NewWatcher(clustercache.WatcherOptions{
-		Name:         "machine-watchNodes",
-		Watcher:      r.controller,
-		Kind:         &corev1.Node{},
-		EventHandler: handler.EnqueueRequestsFromMapFunc(r.nodeToMachine),
-		Predicates:   []predicate.TypedPredicate[client.Object]{predicates.TypedResourceIsChanged[client.Object](r.Client.Scheme(), *r.predicateLog)},
-	}))
+	if r.newNodeWatcher == nil {
+		return pkgerrors.New("newNodeWatcher must be set to watch Nodes; it is set by SetupWithManager and SetupWithMulticlusterManager")
+	}
+
+	watcher, err := r.newNodeWatcher(ctx,
+		"machine-watchNodes",
+		&corev1.Node{},
+		handler.EnqueueRequestsFromMapFunc(r.nodeToMachine),
+		predicates.TypedResourceIsChanged[client.Object](r.Client.Scheme(), *r.predicateLog),
+	)
+	if err != nil {
+		return err
+	}
+
+	return r.ClusterCache.Watch(ctx, util.ObjectKey(cluster), watcher)
 }
 
 func (r *Reconciler) nodeToMachine(ctx context.Context, o client.Object) []reconcile.Request {

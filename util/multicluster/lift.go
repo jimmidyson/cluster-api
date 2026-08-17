@@ -68,12 +68,23 @@ import (
 // path. Nothing in multicluster-runtime does it for the handler path, so this
 // does.
 func LiftWithClusterInContext(h handler.TypedEventHandler[client.Object, reconcile.Request]) mchandler.TypedEventHandlerFunc[client.Object, mcreconcile.Request] {
-	lifted := mchandler.TypedLift[client.Object](h)
-	return func(clusterName mcmulticluster.ClusterName, cl cluster.Cluster) handler.TypedEventHandler[client.Object, mcreconcile.Request] {
-		return &handlerWithClusterInContext{
-			h:           lifted(clusterName, cl),
-			clusterName: clusterName,
-		}
+	return func(clusterName mcmulticluster.ClusterName, _ cluster.Cluster) handler.TypedEventHandler[client.Object, mcreconcile.Request] {
+		return ForClusterWithClusterInContext(h, clusterName)
+	}
+}
+
+// ForClusterWithClusterInContext is LiftWithClusterInContext for a watch whose
+// cluster is already known, rather than one resolved as clusters engage.
+//
+// The Node watches the Machine reconciler adds against a workload cluster are
+// the case that needs it: the watch is established from inside Reconcile, so the
+// cluster it belongs to is whatever the reconcile was for. The events come from
+// the workload cluster and the requests have to name the management cluster the
+// Machine lives in, and the map function has to list there too.
+func ForClusterWithClusterInContext(h handler.TypedEventHandler[client.Object, reconcile.Request], clusterName mcmulticluster.ClusterName) handler.TypedEventHandler[client.Object, mcreconcile.Request] {
+	return &handlerWithClusterInContext{
+		h:           mchandler.TypedForCluster[client.Object](h, clusterName),
+		clusterName: clusterName,
 	}
 }
 
