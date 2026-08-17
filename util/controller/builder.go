@@ -242,18 +242,21 @@ func (blder *Builder) Build(ctx context.Context, r reconcile.TypedReconciler[rec
 	blder.builder.WithOptions(blder.options)
 
 	// Create reconcileCache.
-	reconcileCache := cache.New[reconcileCacheEntry](ctx, cache.DefaultTTL)
+	reconcileCache := cache.New[reconcileCacheEntry[reconcile.Request]](ctx, cache.DefaultTTL)
 
 	// Create consistencyStore.
 	consistencyStore := newConsistencyStore(blder.mgr.GetScheme(), blder.mgr.GetCache())
 
-	c, err := blder.builder.Build(&reconcilerWrapper{
+	c, err := blder.builder.Build(&reconcilerWrapper[reconcile.Request]{
 		name:              controllerName,
 		reconciler:        r,
 		reconcileCache:    reconcileCache,
 		rateLimitInterval: rateLimitInterval,
 		queueRateLimiter:  queueRateLimiter,
 		consistencyStore:  consistencyStore,
+		// Single-cluster: the request is the identity, and there is no cluster
+		// to attach.
+		namespacedName: func(req reconcile.Request) types.NamespacedName { return req.NamespacedName },
 	})
 	if err != nil {
 		return nil, err
@@ -267,9 +270,10 @@ func (blder *Builder) Build(ctx context.Context, r reconcile.TypedReconciler[rec
 	reconcileTotal.WithLabelValues(controllerName, labelRequeue).Add(0)
 	reconcileTotal.WithLabelValues(controllerName, labelSuccess).Add(0)
 
-	return &controllerWrapper{
+	return &controllerWrapper[reconcile.Request]{
 		TypedController:  c,
 		reconcileCache:   reconcileCache,
+		newRequest:       func(nn types.NamespacedName) reconcile.Request { return reconcile.Request{NamespacedName: nn} },
 		consistencyStore: consistencyStore,
 	}, nil
 }
