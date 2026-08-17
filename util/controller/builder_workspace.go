@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
+	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -61,6 +62,15 @@ type MulticlusterController interface {
 	// MultiClusterWatch registers a source with every engaged cluster, and with
 	// any that engage later.
 	MultiClusterWatch(src mcsource.TypedSource[client.Object, mcreconcile.Request]) error
+
+	// WatchAllClusters registers a watch added at runtime, by whichever
+	// mechanism this controller was built with.
+	//
+	// The caller supplies a type, an ordinary single-cluster handler and
+	// predicates, and does not choose between per-cluster registration and one
+	// shared registration — that is a property of how the controller was built,
+	// and a caller that had to know would have to be changed to change it.
+	WatchAllClusters(obj client.Object, h handler.TypedEventHandler[client.Object, reconcile.Request], predicates ...predicate.Predicate) error
 }
 
 // multiclusterController joins the shared wrapper — which carries the reconcile
@@ -72,10 +82,26 @@ type MulticlusterController interface {
 type multiclusterController struct {
 	*controllerWrapper[mcreconcile.Request]
 	mc mccontroller.TypedController[mcreconcile.Request]
+
+	// wildcard and clusterOf are set when the builder was given a fleet-spanning
+	// cache, and decide how WatchAllClusters registers.
+	wildcard  crcache.Cache
+	clusterOf capimulticluster.ClusterResolver
 }
 
 func (c *multiclusterController) MultiClusterWatch(src mcsource.TypedSource[client.Object, mcreconcile.Request]) error {
 	return c.mc.MultiClusterWatch(src)
+}
+
+func (c *multiclusterController) WatchAllClusters(obj client.Object, h handler.TypedEventHandler[client.Object, reconcile.Request], predicates ...predicate.Predicate) error {
+	if c.wildcard != nil {
+		return c.mc.Watch(capimulticluster.WildcardSource(c.wildcard, obj, h, c.clusterOf, predicates...))
+	}
+	typed := make([]predicate.TypedPredicate[client.Object], 0, len(predicates))
+	for _, p := range predicates {
+		typed = append(typed, p)
+	}
+	return c.mc.MultiClusterWatch(mcsource.TypedKind(obj, capimulticluster.LiftWithClusterInContext(h), typed...))
 }
 
 // MulticlusterBuilder builds one controller that serves every cluster a
@@ -118,6 +144,73 @@ type MulticlusterBuilder struct {
 	forObject         client.Object
 	controllerName    string
 	rateLimitInterval time.Duration
+
+	// wildcard, when set, replaces per-cluster watch registration with one
+	// registration per type for the whole fleet. See WithWildcardCache.
+	wildcard        crcache.Cache
+	clusterOf       capimulticluster.ClusterResolver
+	wildcardWatches []wildcardWatch
+	globalPredicate predicate.Predicate
+}
+
+// wildcardWatch is a declared watch, held until Build so it can be registered
+// against the shared cache rather than against each cluster as it engages.
+type wildcardWatch struct {
+	object     client.Object
+	handler    handler.TypedEventHandler[client.Object, reconcile.Request]
+	predicates []predicate.Predicate
+	// owner is set for Owns, whose handler cannot be built until the For type
+	// and the scheme are both known.
+	owner bool
+}
+
+// WithWildcardCache makes every watch a single registration across the fleet,
+// instead of one per engaged cluster.
+//
+// # What it changes
+//
+// Nothing a reconciler can see. The same types are watched, the same handlers
+// run, the same requests are enqueued and they carry the same cluster. What
+// changes is how many times the registration happens: once per type, rather than
+// once per type per cluster.
+//
+// # Why it is worth a mode
+//
+// Measured on the fleet-wide wiring before this existed, per-cluster
+// registration was about 45 of the 51.7 goroutines each workspace cost — the
+// entire part that did not collapse when the controllers themselves stopped
+// being per-workspace. It scales as watches × clusters against an informer that
+// is a single object, which is the wrong shape for a provider whose clusters are
+// views over one cache.
+//
+// # What the caller has to know
+//
+// Two things Cluster API cannot work out for itself. The cache must span
+// clusters — under kcp, one built against a /clusters/* endpoint — and objects
+// out of it have to be attributable to a cluster, which is what clusterOf does.
+// Both are properties of the provider, so both are supplied.
+func (blder *MulticlusterBuilder) WithWildcardCache(c crcache.Cache, clusterOf capimulticluster.ClusterResolver) *MulticlusterBuilder {
+	blder.wildcard = c
+	blder.clusterOf = clusterOf
+	return blder
+}
+
+// MulticlusterOption configures a MulticlusterBuilder from a reconciler's setup
+// function, which builds the builder itself and so cannot be handed one.
+type MulticlusterOption func(*MulticlusterBuilder)
+
+// WithWildcard is WithWildcardCache as a setup-function option.
+func WithWildcard(c crcache.Cache, clusterOf capimulticluster.ClusterResolver) MulticlusterOption {
+	return func(b *MulticlusterBuilder) { b.WithWildcardCache(c, clusterOf) }
+}
+
+// Apply applies options to the builder. Setup functions call it so that every
+// reconciler takes the same options in the same way.
+func (blder *MulticlusterBuilder) Apply(opts ...MulticlusterOption) *MulticlusterBuilder {
+	for _, o := range opts {
+		o(blder)
+	}
+	return blder
 }
 
 // NewMulticlusterControllerManagedBy returns a builder for a controller that
@@ -133,6 +226,13 @@ func NewMulticlusterControllerManagedBy(m mcmanager.Manager, predicateLog logr.L
 // For defines the type of Object being reconciled.
 func (blder *MulticlusterBuilder) For(object client.Object, opts ...mcbuilder.ForOption) *MulticlusterBuilder {
 	blder.forObject = object
+	if blder.wildcard != nil {
+		blder.wildcardWatches = append(blder.wildcardWatches, wildcardWatch{
+			object:  object,
+			handler: &handler.EnqueueRequestForObject{},
+		})
+		return blder
+	}
 	blder.builder.For(object, opts...)
 	return blder
 }
@@ -141,6 +241,14 @@ func (blder *MulticlusterBuilder) For(object client.Object, opts ...mcbuilder.Fo
 func (blder *MulticlusterBuilder) Owns(object client.Object, predicates ...predicate.Predicate) *MulticlusterBuilder {
 	// Note: Prepend a ResourceIsChanged predicate to all "secondary" watches, matching Builder.
 	predicates = append([]predicate.Predicate{predicatesutil.ResourceIsChanged(blder.mgr.GetLocalManager().GetScheme(), blder.predicateLog)}, predicates...)
+	if blder.wildcard != nil {
+		blder.wildcardWatches = append(blder.wildcardWatches, wildcardWatch{
+			object:     object,
+			predicates: predicates,
+			owner:      true,
+		})
+		return blder
+	}
 	blder.builder.Owns(object, mcbuilder.WithPredicates(predicates...))
 	return blder
 }
@@ -159,6 +267,14 @@ func (blder *MulticlusterBuilder) Owns(object client.Object, predicates ...predi
 // and the lift supplies the cluster around both.
 func (blder *MulticlusterBuilder) Watches(object client.Object, eventHandler handler.TypedEventHandler[client.Object, reconcile.Request], predicates ...predicate.Predicate) *MulticlusterBuilder {
 	predicates = append([]predicate.Predicate{predicatesutil.ResourceIsChanged(blder.mgr.GetLocalManager().GetScheme(), blder.predicateLog)}, predicates...)
+	if blder.wildcard != nil {
+		blder.wildcardWatches = append(blder.wildcardWatches, wildcardWatch{
+			object:     object,
+			handler:    eventHandler,
+			predicates: predicates,
+		})
+		return blder
+	}
 	blder.builder.Watches(object, capimulticluster.LiftWithClusterInContext(eventHandler), mcbuilder.WithPredicates(predicates...))
 	return blder
 }
@@ -190,6 +306,7 @@ func (blder *MulticlusterBuilder) WithRateLimitInterval(interval time.Duration) 
 
 // WithEventFilter sets a predicate applied to all watches.
 func (blder *MulticlusterBuilder) WithEventFilter(p predicate.Predicate) *MulticlusterBuilder {
+	blder.globalPredicate = p
 	blder.builder.WithEventFilter(p)
 	return blder
 }
@@ -306,13 +423,10 @@ func (blder *MulticlusterBuilder) Build(ctx context.Context, r reconcile.Reconci
 		return nil, err
 	}
 
-	reconcileTotal.WithLabelValues(controllerName, labelError).Add(0)
-	reconcileTotal.WithLabelValues(controllerName, labelRequeueAfter).Add(0)
-	reconcileTotal.WithLabelValues(controllerName, labelRequeue).Add(0)
-	reconcileTotal.WithLabelValues(controllerName, labelSuccess).Add(0)
-
-	return &multiclusterController{
-		mc: c,
+	mc := &multiclusterController{
+		mc:        c,
+		wildcard:  blder.wildcard,
+		clusterOf: blder.clusterOf,
 		controllerWrapper: &controllerWrapper[mcreconcile.Request]{
 			TypedController:  c,
 			reconcileCache:   reconcileCache,
@@ -328,5 +442,33 @@ func (blder *MulticlusterBuilder) Build(ctx context.Context, r reconcile.Reconci
 				return mcreconcile.Request{Request: reconcile.Request{NamespacedName: nn}}
 			},
 		},
-	}, nil
+	}
+
+	// Wildcard watches are registered here rather than through the multicluster
+	// builder, because the builder's job is to bind a source to each cluster as
+	// it engages and these deliberately bind to none: one registration on the
+	// shared cache serves the fleet.
+	for _, w := range blder.wildcardWatches {
+		h := w.handler
+		if w.owner {
+			if blder.forObject == nil {
+				return nil, pkgerrors.New("Owns() can only be used together with For()")
+			}
+			h = handler.EnqueueRequestForOwner(localMgr.GetScheme(), localMgr.GetRESTMapper(), blder.forObject)
+		}
+		preds := w.predicates
+		if blder.globalPredicate != nil {
+			preds = append([]predicate.Predicate{blder.globalPredicate}, preds...)
+		}
+		if err := c.Watch(capimulticluster.WildcardSource(blder.wildcard, w.object, h, blder.clusterOf, preds...)); err != nil {
+			return nil, pkgerrors.Wrapf(err, "registering a fleet-wide watch on %T", w.object)
+		}
+	}
+
+	reconcileTotal.WithLabelValues(controllerName, labelError).Add(0)
+	reconcileTotal.WithLabelValues(controllerName, labelRequeueAfter).Add(0)
+	reconcileTotal.WithLabelValues(controllerName, labelRequeue).Add(0)
+	reconcileTotal.WithLabelValues(controllerName, labelSuccess).Add(0)
+
+	return mc, nil
 }

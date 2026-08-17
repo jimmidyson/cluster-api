@@ -70,6 +70,7 @@ func (r *Reconciler) SetupWithMulticlusterManager(
 	mgr mcmanager.Manager,
 	options controller.TypedOptions[mcreconcile.Request],
 	clusterSource clustercache.MulticlusterClusterSourceFunc,
+	opts ...capicontrollerutil.MulticlusterOption,
 ) error {
 	if r.Client == nil || r.APIReader == nil || r.ClusterCache == nil || r.RemoteConnectionGracePeriod == time.Duration(0) {
 		return pkgerrors.New("Client, APIReader and ClusterCache must not be nil and RemoteConnectionGracePeriod must not be 0")
@@ -82,6 +83,7 @@ func (r *Reconciler) SetupWithMulticlusterManager(
 	predicateLog := ctrl.LoggerFrom(ctx).WithValues("controller", "cluster")
 
 	b := capicontrollerutil.NewMulticlusterControllerManagedBy(mgr, predicateLog).
+		Apply(opts...).
 		For(&clusterv1.Cluster{}).
 		WatchesRawSource(clusterSource("cluster", func(_ context.Context, o client.Object) []ctrl.Request {
 			return []ctrl.Request{{NamespacedName: client.ObjectKeyFromObject(o)}}

@@ -58,6 +58,7 @@ func (r *Reconciler) SetupWithMulticlusterManager(
 	mgr mcmanager.Manager,
 	options controller.TypedOptions[mcreconcile.Request],
 	clusterSource clustercache.MulticlusterClusterSourceFunc,
+	opts ...capicontrollerutil.MulticlusterOption,
 ) error {
 	if r.Client == nil || r.APIReader == nil || r.ClusterCache == nil || r.RemoteConditionsGracePeriod < 2*time.Minute {
 		return pkgerrors.New("Client, APIReader and ClusterCache must not be nil and RemoteConditionsGracePeriod must not be < 2m")
@@ -94,6 +95,7 @@ func (r *Reconciler) SetupWithMulticlusterManager(
 	}
 
 	c, err := capicontrollerutil.NewMulticlusterControllerManagedBy(mgr, *r.predicateLog).
+		Apply(opts...).
 		For(&clusterv1.Machine{}).
 		WithOptions(options).
 		WithEventFilter(predicates.ResourceHasFilterLabel(localMgr.GetScheme(), *r.predicateLog, r.WatchFilterValue)).

@@ -28,23 +28,26 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
-	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
-	mcsource "sigs.k8s.io/multicluster-runtime/pkg/source"
-
-	capimulticluster "sigs.k8s.io/cluster-api/util/multicluster"
 	"sigs.k8s.io/cluster-api/util/predicates"
 )
 
-// MultiClusterWatcher registers a source with every cluster a controller serves,
-// including clusters that engage after registration.
+// MultiClusterWatcher registers a watch across every cluster a controller
+// serves, including clusters that engage after registration.
 //
 // controller-runtime's Watch cannot express that: it binds a source to one
 // cache. A watch added at runtime — which is what this tracker exists for — must
 // reach clusters that were not engaged when it was added.
+//
+// It takes a type and a handler rather than a source because *how* that reaches
+// every cluster is the controller's business: registering per cluster and
+// registering once against a fleet-spanning cache are both correct, they differ
+// by orders of magnitude in cost, and a tracker that named one would have to be
+// changed to use the other.
 type MultiClusterWatcher interface {
-	MultiClusterWatch(src mcsource.TypedSource[client.Object, mcreconcile.Request]) error
+	WatchAllClusters(obj client.Object, h handler.TypedEventHandler[client.Object, reconcile.Request], predicates ...predicate.Predicate) error
 }
 
 // ObjectTracker is a helper struct to deal when watching external unstructured objects.
@@ -100,16 +103,7 @@ func (o *ObjectTracker) Watch(log logr.Logger, obj client.Object, handler handle
 
 	var err error
 	if o.MultiClusterController != nil {
-		// LiftWithClusterInContext produces a handler *factory* keyed by cluster
-		// rather than a handler, because a multicluster source builds one
-		// handler per engaged cluster. That is why this cannot go through
-		// source.Kind: there is no single cluster to build the handler for at
-		// registration time.
-		err = o.MultiClusterController.MultiClusterWatch(mcsource.TypedKind(
-			obj.DeepCopyObject().(client.Object),
-			capimulticluster.LiftWithClusterInContext(handler),
-			preds...,
-		))
+		err = o.MultiClusterController.WatchAllClusters(obj.DeepCopyObject().(client.Object), handler, preds...)
 	} else {
 		err = o.Controller.Watch(source.Kind(
 			o.Cache,

@@ -88,7 +88,7 @@ func keyFor(ctx context.Context, cluster client.ObjectKey) accessorKey {
 // Options.SecretClient must resolve the logical cluster from the context too —
 // it reads each Cluster's kubeconfig Secret, and reading the wrong workspace's
 // is how a workload cluster gets handed to the wrong tenant.
-func SetupWithMulticlusterManager(ctx context.Context, mgr mcmanager.Manager, cl client.Client, options Options, controllerOptions controller.TypedOptions[mcreconcile.Request]) (MulticlusterClusterCache, error) {
+func SetupWithMulticlusterManager(ctx context.Context, mgr mcmanager.Manager, cl client.Client, options Options, controllerOptions controller.TypedOptions[mcreconcile.Request], opts ...capicontrollerutil.MulticlusterOption) (MulticlusterClusterCache, error) {
 	log := ctrl.LoggerFrom(ctx).WithValues("controller", "clustercache")
 
 	if cl == nil {
@@ -111,6 +111,7 @@ func SetupWithMulticlusterManager(ctx context.Context, mgr mcmanager.Manager, cl
 
 	predicateLog := ctrl.LoggerFrom(ctx).WithValues("controller", "clustercache")
 	err := capicontrollerutil.NewMulticlusterControllerManagedBy(mgr, predicateLog).
+		Apply(opts...).
 		Named("clustercache").
 		For(&clusterv1.Cluster{}).
 		WithOptions(controllerOptions).
