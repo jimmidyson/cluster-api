@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
@@ -81,8 +82,12 @@ type MulticlusterController interface {
 // the same code the single-cluster builder uses, so the two cannot drift.
 type multiclusterController struct {
 	*controllerWrapper[mcreconcile.Request]
+
+	// mc is nil in wildcard mode: the controller is not engaged with clusters,
+	// so there is no multicluster controller wrapping it. See buildWildcard.
 	mc mccontroller.TypedController[mcreconcile.Request]
 
+	//
 	// wildcard and clusterOf are set when the builder was given a fleet-spanning
 	// cache, and decide how WatchAllClusters registers.
 	wildcard  crcache.Cache
@@ -90,12 +95,16 @@ type multiclusterController struct {
 }
 
 func (c *multiclusterController) MultiClusterWatch(src mcsource.TypedSource[client.Object, mcreconcile.Request]) error {
+	if c.mc == nil {
+		return pkgerrors.New("this controller registers its watches once against a fleet-spanning cache and is not engaged per cluster, " +
+			"so it cannot register a per-cluster source; use WatchAllClusters")
+	}
 	return c.mc.MultiClusterWatch(src)
 }
 
 func (c *multiclusterController) WatchAllClusters(obj client.Object, h handler.TypedEventHandler[client.Object, reconcile.Request], predicates ...predicate.Predicate) error {
 	if c.wildcard != nil {
-		return c.mc.Watch(capimulticluster.WildcardSource(c.wildcard, obj, h, c.clusterOf, predicates...))
+		return c.TypedController.Watch(capimulticluster.WildcardSource(c.wildcard, obj, h, c.clusterOf, predicates...))
 	}
 	typed := make([]predicate.TypedPredicate[client.Object], 0, len(predicates))
 	for _, p := range predicates {
@@ -183,7 +192,7 @@ type wildcardWatch struct {
 // is a single object, which is the wrong shape for a provider whose clusters are
 // views over one cache.
 //
-// With this on, the same measurement is 8.1 goroutines per workspace.
+// With this on, the same measurement is 5.1 goroutines per workspace.
 //
 // # What the caller has to know
 //
@@ -195,6 +204,72 @@ func (blder *MulticlusterBuilder) WithWildcardCache(c crcache.Cache, clusterOf c
 	blder.wildcard = c
 	blder.clusterOf = clusterOf
 	return blder
+}
+
+// buildWildcard builds a controller that is not engaged with clusters at all.
+//
+// # Why it does not go through the multicluster builder
+//
+// That builder produces a controller the manager engages: on every engagement
+// it walks the controller's per-cluster sources, binds each to the joining
+// cluster, records the cluster in a map and starts a goroutine to remove it
+// again when the engagement ends.
+//
+// In wildcard mode there are no per-cluster sources — every watch is one
+// registration against the shared cache — so all of that reduces to the
+// bookkeeping and its goroutine. Measured, that goroutine was three of the 8.1
+// per workspace that remained after the watches were fixed: one per controller
+// per engaged cluster, doing nothing for a controller with nothing to engage.
+//
+// A controller that never engages does not pay it: 8.1 becomes 5.1, and the
+// group disappears from the profile. Nothing is lost, because the
+// two things engagement provides are not used here: the per-cluster sources do
+// not exist, and cluster resolution happens through the manager on the reconcile
+// path, which never consulted the controller's map.
+//
+// # What has to be replicated
+//
+// One thing. The multicluster builder wraps the reconciler so that a request
+// naming a cluster the provider does not have is dropped rather than retried
+// forever. That matters more here, not less: a wildcard source sees objects from
+// every cluster the endpoint serves, including ones the provider has not
+// engaged, so unresolvable requests are expected rather than exceptional.
+func (blder *MulticlusterBuilder) buildWildcard(
+	controllerName string,
+	reconciler reconcile.TypedReconciler[mcreconcile.Request],
+	localMgr manager.Manager,
+) (controller.TypedController[mcreconcile.Request], error) {
+	options := blder.options
+	options.Reconciler = mcreconcile.NewClusterNotFoundWrapper(reconciler)
+
+	c, err := controller.NewTyped(controllerName, localMgr, options)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, w := range blder.wildcardWatches {
+		h := w.handler
+		if w.owner {
+			if blder.forObject == nil {
+				return nil, pkgerrors.New("Owns() can only be used together with For()")
+			}
+			h = handler.EnqueueRequestForOwner(localMgr.GetScheme(), localMgr.GetRESTMapper(), blder.forObject)
+		}
+		preds := w.predicates
+		if blder.globalPredicate != nil {
+			// Prepended, so a global filter cannot be overridden by a
+			// watch-specific one that happens to come first.
+			preds = append([]predicate.Predicate{blder.globalPredicate}, preds...)
+		}
+		if err := c.Watch(capimulticluster.WildcardSource(blder.wildcard, w.object, h, blder.clusterOf, preds...)); err != nil {
+			return nil, pkgerrors.Wrapf(err, "registering a fleet-wide watch on %T", w.object)
+		}
+	}
+	if len(blder.wildcardWatches) == 0 {
+		return nil, pkgerrors.New("there are no watches configured, controller will never get triggered. Use For(), Owns() or Watches() to set them up")
+	}
+
+	return c, nil
 }
 
 // MulticlusterOption configures a MulticlusterBuilder from a reconciler's setup
@@ -394,37 +469,6 @@ func (blder *MulticlusterBuilder) Build(ctx context.Context, r reconcile.Reconci
 
 	blder.builder.WithOptions(blder.options)
 
-	// Wildcard watches become raw sources on the underlying builder.
-	//
-	// Raw is the right category and not a workaround: a raw source is one the
-	// builder registers with the controller as given, rather than binding to
-	// each cluster as it engages — which is exactly what a single registration
-	// across a fleet-spanning cache is. It also means the builder still sees
-	// watches, so its "no watches configured" check keeps working.
-	if blder.wildcard != nil {
-		// The underlying builder derives the controller name from For(), which
-		// wildcard mode does not give it. The name computed above is the same
-		// one it would have derived, so this only tells it what it already would
-		// have known.
-		blder.builder.Named(controllerName)
-	}
-	for _, w := range blder.wildcardWatches {
-		h := w.handler
-		if w.owner {
-			if blder.forObject == nil {
-				return nil, pkgerrors.New("Owns() can only be used together with For()")
-			}
-			h = handler.EnqueueRequestForOwner(localMgr.GetScheme(), localMgr.GetRESTMapper(), blder.forObject)
-		}
-		preds := w.predicates
-		if blder.globalPredicate != nil {
-			// Prepended, so a global filter cannot be overridden by a
-			// watch-specific one that happens to come first.
-			preds = append([]predicate.Predicate{blder.globalPredicate}, preds...)
-		}
-		blder.builder.WatchesRawSource(capimulticluster.WildcardSource(blder.wildcard, w.object, h, blder.clusterOf, preds...))
-	}
-
 	reconcileCache := cache.New[reconcileCacheEntry[mcreconcile.Request]](ctx, cache.DefaultTTL)
 
 	// The consistency store is the local manager's.
@@ -440,7 +484,7 @@ func (blder *MulticlusterBuilder) Build(ctx context.Context, r reconcile.Reconci
 	// this cluster-aware first.
 	consistencyStore := newConsistencyStore(localMgr.GetScheme(), localMgr.GetCache())
 
-	c, err := blder.builder.Build(&reconcilerWrapper[mcreconcile.Request]{
+	reconciler := &reconcilerWrapper[mcreconcile.Request]{
 		name:              controllerName,
 		reconciler:        mccontext.ReconcilerWithClusterInContext(r),
 		reconcileCache:    reconcileCache,
@@ -451,13 +495,25 @@ func (blder *MulticlusterBuilder) Build(ctx context.Context, r reconcile.Reconci
 		// alongside it and is deliberately not part of what the consistency
 		// store sees, per the note above.
 		namespacedName: func(req mcreconcile.Request) types.NamespacedName { return req.NamespacedName },
-	})
+	}
+
+	var (
+		c   controller.TypedController[mcreconcile.Request]
+		mcc mccontroller.TypedController[mcreconcile.Request]
+		err error
+	)
+	if blder.wildcard != nil {
+		c, err = blder.buildWildcard(controllerName, reconciler, localMgr)
+	} else {
+		mcc, err = blder.builder.Build(reconciler)
+		c = mcc
+	}
 	if err != nil {
 		return nil, err
 	}
 
 	mc := &multiclusterController{
-		mc:        c,
+		mc:        mcc,
 		wildcard:  blder.wildcard,
 		clusterOf: blder.clusterOf,
 		controllerWrapper: &controllerWrapper[mcreconcile.Request]{
