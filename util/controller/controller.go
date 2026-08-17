@@ -172,19 +172,28 @@ type controllerWrapper[request RequestType] struct {
 	newRequest func(types.NamespacedName) request
 }
 
-func (c *controllerWrapper[request]) DeferNextReconcile(req request, reconcileAfter time.Time) {
+// DeferNextReconcile takes a plain reconcile.Request, not the parameterised
+// one, so that the public Controller interface is identical whether the
+// controller serves one cluster or many — reconcilers call this from inside
+// Reconcile, and changing its signature would change reconcile code.
+//
+// newRequest turns the identity into whatever the queue is keyed on. For a
+// fleet-wide controller that request carries no cluster, so the deferral
+// applies to the object in every cluster; see the note where newRequest is
+// supplied.
+func (c *controllerWrapper[request]) DeferNextReconcile(req reconcile.Request, reconcileAfter time.Time) {
 	c.reconcileCache.Add(reconcileCacheEntry[request]{
-		Request:        req,
+		Request:        c.newRequest(req.NamespacedName),
 		ReconcileAfter: reconcileAfter,
 	})
 }
 
 func (c *controllerWrapper[request]) DeferNextReconcileForObject(obj metav1.Object, reconcileAfter time.Time) {
-	c.DeferNextReconcile(c.newRequest(
-		types.NamespacedName{
+	c.DeferNextReconcile(reconcile.Request{
+		NamespacedName: types.NamespacedName{
 			Namespace: obj.GetNamespace(),
 			Name:      obj.GetName(),
-		}), reconcileAfter)
+		}}, reconcileAfter)
 }
 
 // reconcileCacheEntry is an Entry for the Cache that stores the
