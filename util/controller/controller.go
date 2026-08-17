@@ -37,19 +37,47 @@ import (
 
 const requeueDurationStaleCache = 100 * time.Millisecond
 
+// RequestType is what a controller's queue items must satisfy for the wrapping
+// machinery below — the reconcile cache, the rate limiter and the metrics — to
+// work regardless of whether the controller serves one cluster or many.
+//
+// Both request types already satisfy it. reconcile.Request is comparable and
+// promotes String() from its embedded NamespacedName;
+// mcreconcile.Request is comparable and overrides String() to include the
+// cluster, which is what keeps two clusters' identically-named objects apart in
+// the reconcile cache and the rate limiter.
+//
+// That last point is the whole reason this is a type parameter rather than a
+// second copy of the machinery: a duplicate would have to re-derive the cache
+// key, and a duplicate that got it wrong would collide across clusters
+// silently.
+type RequestType interface {
+	comparable
+	fmt.Stringer
+}
+
 var atMostEvery10Seconds = newAtMostEvery(10 * time.Second)
 
-type reconcilerWrapper struct {
+type reconcilerWrapper[request RequestType] struct {
 	name              string
-	reconcileCache    cache.Cache[reconcileCacheEntry]
-	reconciler        reconcile.Reconciler
+	reconcileCache    cache.Cache[reconcileCacheEntry[request]]
+	reconciler        reconcile.TypedReconciler[request]
 	rateLimitInterval time.Duration
-	queueRateLimiter  *typedItemExponentialFailureRateLimiter[reconcile.Request]
+	queueRateLimiter  *typedItemExponentialFailureRateLimiter[request]
 	consistencyStore  consistencyStore
+
+	// namespacedName extracts the object identity from a request.
+	//
+	// A function rather than a constraint method, and passed in explicitly by
+	// whichever builder constructs this: a type parameter has no fields, and
+	// neither request type exposes its NamespacedName through a method. Wiring
+	// it in keeps the dependency visible at the construction site instead of
+	// hiding it behind an interface assertion.
+	namespacedName func(request) types.NamespacedName
 }
 
 // Reconcile reconciles the passed in object.
-func (r *reconcilerWrapper) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+func (r *reconcilerWrapper[request]) Reconcile(ctx context.Context, req request) (reconcile.Result, error) {
 	if !feature.Gates.Enabled(feature.ReconcilerRateLimiting) {
 		return r.reconciler.Reconcile(ctx, req)
 	}
@@ -57,13 +85,13 @@ func (r *reconcilerWrapper) Reconcile(ctx context.Context, req reconcile.Request
 	reconcileStartTime := time.Now()
 
 	// Check reconcileCache to ensure we won't run reconcile too frequently.
-	if cacheEntry, ok := r.reconcileCache.Has(reconcileCacheEntry{Request: req}.Key()); ok {
+	if cacheEntry, ok := r.reconcileCache.Has(reconcileCacheEntry[request]{Request: req}.Key()); ok {
 		if requeueAfter, requeue := cacheEntry.ShouldRequeue(reconcileStartTime); requeue {
 			return ctrl.Result{RequeueAfter: requeueAfter}, nil
 		}
 	}
 
-	consistencyErrs, err := r.consistencyStore.EnsureReady(ctx, req.NamespacedName)
+	consistencyErrs, err := r.consistencyStore.EnsureReady(ctx, r.namespacedName(req))
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -89,7 +117,7 @@ func (r *reconcilerWrapper) Reconcile(ctx context.Context, req reconcile.Request
 	// Under certain circumstances the ReconcileAfter time will be set to a later time via DeferNextReconcile /
 	// DeferNextReconcileForObject, e.g. when we're waiting for Pods to terminate during node drain or
 	// volumes to detach. This is done to ensure we're not spamming the workload cluster API server.
-	r.reconcileCache.Add(reconcileCacheEntry{Request: req, ReconcileAfter: reconcileStartTime.Add(r.rateLimitInterval)})
+	r.reconcileCache.Add(reconcileCacheEntry[request]{Request: req, ReconcileAfter: reconcileStartTime.Add(r.rateLimitInterval)})
 
 	// Update metrics after processing each item
 	defer func() {
@@ -115,7 +143,7 @@ func (r *reconcilerWrapper) Reconcile(ctx context.Context, req reconcile.Request
 		// TODO: It would also be possible to extend r.queueRateLimiter to set a request-specific minimum requeueAfter.
 		// This would allow us to also enforce a minimum requeueAfter for the err != nil and Requeue cases.
 		minimumRequeueAfter := r.rateLimitInterval
-		if cacheEntry, ok := r.reconcileCache.Has(reconcileCacheEntry{Request: req}.Key()); ok {
+		if cacheEntry, ok := r.reconcileCache.Has(reconcileCacheEntry[request]{Request: req}.Key()); ok {
 			if requeueAfter, requeue := cacheEntry.ShouldRequeue(time.Now()); requeue {
 				minimumRequeueAfter = requeueAfter
 			}
@@ -133,43 +161,54 @@ func (r *reconcilerWrapper) Reconcile(ctx context.Context, req reconcile.Request
 	return result, err
 }
 
-type controllerWrapper struct {
-	controller.TypedController[reconcile.Request]
-	reconcileCache   cache.Cache[reconcileCacheEntry]
+type controllerWrapper[request RequestType] struct {
+	controller.TypedController[request]
+	reconcileCache   cache.Cache[reconcileCacheEntry[request]]
 	consistencyStore consistencyStore
+
+	// newRequest builds a queue item from an object identity. The multicluster
+	// builder supplies one that attaches the cluster; the single-cluster
+	// builder supplies one that does not.
+	newRequest func(types.NamespacedName) request
 }
 
-func (c *controllerWrapper) DeferNextReconcile(req reconcile.Request, reconcileAfter time.Time) {
-	c.reconcileCache.Add(reconcileCacheEntry{
+func (c *controllerWrapper[request]) DeferNextReconcile(req request, reconcileAfter time.Time) {
+	c.reconcileCache.Add(reconcileCacheEntry[request]{
 		Request:        req,
 		ReconcileAfter: reconcileAfter,
 	})
 }
 
-func (c *controllerWrapper) DeferNextReconcileForObject(obj metav1.Object, reconcileAfter time.Time) {
-	c.DeferNextReconcile(reconcile.Request{
-		NamespacedName: types.NamespacedName{
+func (c *controllerWrapper[request]) DeferNextReconcileForObject(obj metav1.Object, reconcileAfter time.Time) {
+	c.DeferNextReconcile(c.newRequest(
+		types.NamespacedName{
 			Namespace: obj.GetNamespace(),
 			Name:      obj.GetName(),
-		}}, reconcileAfter)
+		}), reconcileAfter)
 }
 
 // reconcileCacheEntry is an Entry for the Cache that stores the
 // earliest time after which the next Reconcile should be executed.
-type reconcileCacheEntry struct {
-	Request        reconcile.Request
+type reconcileCacheEntry[request RequestType] struct {
+	Request        request
 	ReconcileAfter time.Time
 }
 
-var _ cache.Entry = &reconcileCacheEntry{}
+var _ cache.Entry = &reconcileCacheEntry[reconcile.Request]{}
 
 // Key returns the cache key of a reconcileCacheEntry.
-func (r reconcileCacheEntry) Key() string {
+//
+// String() rather than the bare NamespacedName, and that is load-bearing for
+// multicluster use: mcreconcile.Request's String() prefixes the cluster, so two
+// clusters' identically-named objects get distinct keys. A key derived from
+// namespace and name alone would let one cluster's rate limiting suppress
+// another's reconcile.
+func (r reconcileCacheEntry[request]) Key() string {
 	return r.Request.String()
 }
 
 // ShouldRequeue returns if the current Reconcile should be requeued.
-func (r reconcileCacheEntry) ShouldRequeue(now time.Time) (requeueAfter time.Duration, requeue bool) {
+func (r reconcileCacheEntry[request]) ShouldRequeue(now time.Time) (requeueAfter time.Duration, requeue bool) {
 	if r.ReconcileAfter.IsZero() {
 		return time.Duration(0), false
 	}
@@ -181,14 +220,14 @@ func (r reconcileCacheEntry) ShouldRequeue(now time.Time) (requeueAfter time.Dur
 	return time.Duration(0), false
 }
 
-func (c *controllerWrapper) DeferNextReconcileUntilCacheUpToDate(reconciledObject metav1.Object, writtenObjectGVKT GroupVersionKindType, writtenObjectResourceVersion string) {
+func (c *controllerWrapper[request]) DeferNextReconcileUntilCacheUpToDate(reconciledObject metav1.Object, writtenObjectGVKT GroupVersionKindType, writtenObjectResourceVersion string) {
 	// Note: We are using GroupResource here because we want to avoid making bigger changes to the vendored consistencyStore util.
 	// We could calculate GroupResource from a client.Object but we would have to handle error cases.
 	c.consistencyStore.WroteAt(client.ObjectKey{Namespace: reconciledObject.GetNamespace(), Name: reconciledObject.GetName()},
 		reconciledObject.GetUID(), writtenObjectGVKT, writtenObjectResourceVersion)
 }
 
-func (c *controllerWrapper) ClearConsistencyStore(reconciledObject client.ObjectKey, reconciledObjectUID types.UID) {
+func (c *controllerWrapper[request]) ClearConsistencyStore(reconciledObject client.ObjectKey, reconciledObjectUID types.UID) {
 	c.consistencyStore.Clear(reconciledObject, reconciledObjectUID)
 }
 

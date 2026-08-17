@@ -53,7 +53,7 @@ func TestReconcile(t *testing.T) {
 	// Note: synctest.Test below will run with a fake clock, so it will add
 	// entries to the cache with a timestamp ~ 2020. We are using a high expiration
 	// time here so that the cache does not expire our entries during the test run.
-	reconcileCache := cache.New[reconcileCacheEntry](t.Context(), 250*365*24*time.Hour) // 250 years
+	reconcileCache := cache.New[reconcileCacheEntry[reconcile.Request]](t.Context(), 250*365*24*time.Hour) // 250 years
 
 	synctest.Test(t, func(t *testing.T) {
 		g := NewWithT(t)
@@ -63,7 +63,7 @@ func TestReconcile(t *testing.T) {
 		consistencyStore := &fakeConsistencyStore{}
 
 		var reconcileCounter atomic.Int64
-		r := &reconcilerWrapper{
+		r := &reconcilerWrapper[reconcile.Request]{
 			name:           "cluster",
 			reconcileCache: reconcileCache,
 			reconciler: reconcile.Func(func(_ context.Context, _ reconcile.Request) (reconcile.Result, error) {
@@ -74,7 +74,7 @@ func TestReconcile(t *testing.T) {
 			queueRateLimiter:  newTypedItemExponentialFailureRateLimiter[reconcile.Request](rateLimitInterval, 5*time.Millisecond, 1000*time.Second),
 			consistencyStore:  consistencyStore,
 		}
-		c := controllerWrapper{
+		c := controllerWrapper[reconcile.Request]{
 			reconcileCache: reconcileCache,
 		}
 
@@ -283,14 +283,14 @@ func TestReconcileMetrics(t *testing.T) {
 
 	// reconcileCache has to be created outside synctest.Test, otherwise
 	// the test would fail because of the cleanup go routine in the cache.
-	reconcileCache := cache.New[reconcileCacheEntry](t.Context(), cache.DefaultTTL)
+	reconcileCache := cache.New[reconcileCacheEntry[reconcile.Request]](t.Context(), cache.DefaultTTL)
 
 	synctest.Test(t, func(t *testing.T) {
 		g := NewWithT(t)
 
 		rateLimitInterval := 1 * time.Second
 
-		r := reconcilerWrapper{
+		r := reconcilerWrapper[reconcile.Request]{
 			name:              "cluster",
 			reconcileCache:    reconcileCache,
 			rateLimitInterval: rateLimitInterval,
@@ -431,7 +431,7 @@ func TestShouldRequeue(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			g := NewWithT(t)
 
-			gotRequeueAfter, gotRequeue := reconcileCacheEntry{ReconcileAfter: tt.reconcileAfter}.ShouldRequeue(tt.now)
+			gotRequeueAfter, gotRequeue := reconcileCacheEntry[reconcile.Request]{ReconcileAfter: tt.reconcileAfter}.ShouldRequeue(tt.now)
 			g.Expect(gotRequeue).To(Equal(tt.wantRequeue))
 			g.Expect(gotRequeueAfter).To(Equal(tt.wantRequeueAfter))
 		})

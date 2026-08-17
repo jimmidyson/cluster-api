@@ -77,7 +77,7 @@ func TestBuilder(t *testing.T) {
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(c).ToNot(BeNil())
 
-	typedController := (c.(*controllerWrapper)).TypedController
+	typedController := (c.(*controllerWrapper[reconcile.Request])).TypedController
 
 	// Verify ReconciliationTimeout.
 	var timeDurationType time.Duration
