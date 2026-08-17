@@ -72,6 +72,8 @@ type ClusterResolver func(client.Object) (mcmulticluster.ClusterName, bool)
 //
 // Measured on the same wiring afterwards: 8.1 goroutines per workspace against
 // 51.7, and ten informer listeners for the whole shard against 73 and climbing.
+// Dropping the per-cluster engagement this makes unnecessary takes it to 5.1;
+// see MulticlusterBuilder.buildWildcard.
 //
 // # What it gives the handler
 //
