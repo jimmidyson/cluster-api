@@ -23,12 +23,16 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
-	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/source"
+
+	mccontext "sigs.k8s.io/multicluster-runtime/pkg/context"
+	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
+	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 
 	"sigs.k8s.io/cluster-api/test/infrastructure/container"
 	infrav1 "sigs.k8s.io/cluster-api/test/infrastructure/docker/api/v1beta2"
@@ -38,7 +42,7 @@ import (
 func NewTaskManager() *TaskManager {
 	return &TaskManager{
 		tasks:        make(map[string]*TaskState),
-		progressChan: make(chan event.GenericEvent, 100),
+		progressChan: make(chan taskProgress, 100),
 	}
 }
 
@@ -46,11 +50,26 @@ func NewTaskManager() *TaskManager {
 type TaskManager struct {
 	mu           sync.RWMutex
 	tasks        map[string]*TaskState
-	progressChan chan event.GenericEvent
+	progressChan chan taskProgress
+}
+
+// taskProgress is a task's progress event together with the logical cluster the
+// DockerMachine lives in.
+//
+// The cluster travels alongside the object because the object does not name it,
+// and a fleet-wide controller's queue is keyed on a request that does. It is
+// empty when the controller serves one cluster.
+type taskProgress struct {
+	cluster multicluster.ClusterName
+	event   event.GenericEvent
 }
 
 // TaskState represent the state of a task.
 type TaskState struct {
+	// cluster is the logical cluster the DockerMachine lives in, empty when the
+	// controller serves one. Unexported: it is the TaskManager's bookkeeping,
+	// not part of the state a caller reads.
+	cluster                     multicluster.ClusterName
 	DockerMachineKey            client.ObjectKey
 	ID                          string
 	Completed                   bool
@@ -91,7 +110,7 @@ type Operation struct {
 // RegisterTask start a task for a dockerMachine.
 func (m *TaskManager) RegisterTask(ctx context.Context, dockerMachine client.Object, id string, operations []Operation, timeout time.Duration) (*TaskState, error) {
 	m.mu.Lock()
-	if _, exists := m.tasks[taskUID(dockerMachine, id)]; exists {
+	if _, exists := m.tasks[taskUID(ctx, dockerMachine, id)]; exists {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("task for %s, ID %s already exist", klog.KObj(dockerMachine), id)
 	}
@@ -107,7 +126,9 @@ func (m *TaskManager) RegisterTask(ctx context.Context, dockerMachine client.Obj
 	ctxWithTimeout = ctrl.LoggerInto(ctxWithTimeout, log)
 	ctxWithTimeout = container.RuntimeInto(ctxWithTimeout, containerRuntime)
 
+	cluster, _ := mccontext.ClusterFrom(ctx)
 	state := &TaskState{
+		cluster:                     cluster,
 		DockerMachineKey:            client.ObjectKeyFromObject(dockerMachine),
 		ID:                          id,
 		Completed:                   false,
@@ -116,7 +137,7 @@ func (m *TaskManager) RegisterTask(ctx context.Context, dockerMachine client.Obj
 		TotalOperations:             len(operations),
 		Cancel:                      cancel,
 	}
-	m.tasks[taskUID(dockerMachine, id)] = state
+	m.tasks[taskUID(ctx, dockerMachine, id)] = state
 	m.mu.Unlock()
 
 	go m.runTask(ctxWithTimeout, state, operations)
@@ -131,7 +152,7 @@ func (m *TaskManager) runTask(ctx context.Context, state *TaskState, operations 
 		m.mu.Lock()
 		state.Err = ctx.Err()
 		m.mu.Unlock()
-		m.progressChan <- state.toEvent()
+		m.progressChan <- taskProgress{cluster: state.cluster, event: state.toEvent()}
 		return
 	default:
 		for i, op := range operations {
@@ -140,7 +161,7 @@ func (m *TaskManager) runTask(ctx context.Context, state *TaskState, operations 
 				m.mu.Lock()
 				state.Err = ctx.Err()
 				m.mu.Unlock()
-				m.progressChan <- state.toEvent()
+				m.progressChan <- taskProgress{cluster: state.cluster, event: state.toEvent()}
 				return
 			}
 
@@ -149,14 +170,14 @@ func (m *TaskManager) runTask(ctx context.Context, state *TaskState, operations 
 			state.CurrentOperationDescription = op.Description
 			state.CurrentOperation = i + 1
 			m.mu.Unlock()
-			m.progressChan <- state.toEvent()
+			m.progressChan <- taskProgress{cluster: state.cluster, event: state.toEvent()}
 
 			if err := op.F(ctx); err != nil {
 				// Report error if the operation fails
 				m.mu.Lock()
 				state.Err = err
 				m.mu.Unlock()
-				m.progressChan <- state.toEvent()
+				m.progressChan <- taskProgress{cluster: state.cluster, event: state.toEvent()}
 				return
 			}
 		}
@@ -165,16 +186,16 @@ func (m *TaskManager) runTask(ctx context.Context, state *TaskState, operations 
 		m.mu.Lock()
 		state.Completed = true
 		m.mu.Unlock()
-		m.progressChan <- state.toEvent()
+		m.progressChan <- taskProgress{cluster: state.cluster, event: state.toEvent()}
 	}
 }
 
 // GetStatus return state of a task.
-func (m *TaskManager) GetStatus(dockerMachine client.Object, id string) *TaskState {
+func (m *TaskManager) GetStatus(ctx context.Context, dockerMachine client.Object, id string) *TaskState {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	state, exists := m.tasks[taskUID(dockerMachine, id)]
+	state, exists := m.tasks[taskUID(ctx, dockerMachine, id)]
 	if !exists {
 		return nil
 	}
@@ -184,20 +205,21 @@ func (m *TaskManager) GetStatus(dockerMachine client.Object, id string) *TaskSta
 }
 
 // ResetStatus the status of a task for a dockerMachine.
-func (m *TaskManager) ResetStatus(dockerMachine client.Object, id string) {
+func (m *TaskManager) ResetStatus(ctx context.Context, dockerMachine client.Object, id string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	delete(m.tasks, taskUID(dockerMachine, id))
+	delete(m.tasks, taskUID(ctx, dockerMachine, id))
 }
 
 // Cancel cancels all the tasks for a dockerMachine.
-func (m *TaskManager) Cancel(dockerMachine client.Object) {
+func (m *TaskManager) Cancel(ctx context.Context, dockerMachine client.Object) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	cluster, _ := mccontext.ClusterFrom(ctx)
 	for id, state := range m.tasks {
-		if state.DockerMachineKey != client.ObjectKeyFromObject(dockerMachine) {
+		if state.DockerMachineKey != client.ObjectKeyFromObject(dockerMachine) || state.cluster != cluster {
 			continue
 		}
 
@@ -209,9 +231,51 @@ func (m *TaskManager) Cancel(dockerMachine client.Object) {
 // GetSource return a controller runtime source that can be used to get notifications when an operation for
 // a dockerMachine is completed.
 func (m *TaskManager) GetSource() source.Source {
-	return source.Channel(m.progressChan, &handler.EnqueueRequestForObject{})
+	return source.Func(func(ctx context.Context, q workqueue.TypedRateLimitingInterface[ctrl.Request]) error {
+		go m.forward(ctx, func(p taskProgress) {
+			q.Add(ctrl.Request{NamespacedName: client.ObjectKeyFromObject(p.event.Object)})
+		})
+		return nil
+	})
 }
 
-func taskUID(dockerMachine client.Object, id string) string {
-	return fmt.Sprintf("%s/%s", client.ObjectKeyFromObject(dockerMachine), id)
+// GetMulticlusterSource is GetSource for a controller that serves every cluster.
+//
+// It cannot go through source.Channel for the same reason the ClusterCache's
+// cannot: the channel carries a client.Object, and the object does not name the
+// logical cluster the request has to be keyed on.
+func (m *TaskManager) GetMulticlusterSource() source.TypedSource[mcreconcile.Request] {
+	return source.TypedFunc[mcreconcile.Request](func(ctx context.Context, q workqueue.TypedRateLimitingInterface[mcreconcile.Request]) error {
+		go m.forward(ctx, func(p taskProgress) {
+			q.Add(mcreconcile.Request{
+				Request:     ctrl.Request{NamespacedName: client.ObjectKeyFromObject(p.event.Object)},
+				ClusterName: p.cluster,
+			})
+		})
+		return nil
+	})
+}
+
+func (m *TaskManager) forward(ctx context.Context, enqueue func(taskProgress)) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case p := <-m.progressChan:
+			enqueue(p)
+		}
+	}
+}
+
+// taskUID identifies a task by the DockerMachine it belongs to, the logical
+// cluster that DockerMachine lives in, and the task's own ID.
+//
+// The logical cluster is part of the key because one TaskManager now serves
+// every cluster: without it, two tenants' identically named DockerMachines share
+// a task, so one tenant's provisioning cancels or reports on the other's. It is
+// empty when the controller serves one cluster, which keys every task the same
+// way it did before.
+func taskUID(ctx context.Context, dockerMachine client.Object, id string) string {
+	cluster, _ := mccontext.ClusterFrom(ctx)
+	return fmt.Sprintf("%s/%s/%s", cluster, client.ObjectKeyFromObject(dockerMachine), id)
 }

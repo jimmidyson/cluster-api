@@ -18,7 +18,10 @@ package reconcilers
 
 import (
 	"context"
+	"time"
+
 	"fmt"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	pkgerrors "github.com/pkg/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -48,10 +51,20 @@ import (
 	"sigs.k8s.io/cluster-api/util/predicates"
 )
 
+// devMachineController is the part of the built controller the reconcile path
+// uses.
+//
+// Narrowed from capicontrollerutil.Controller so the field can hold either the
+// single-cluster controller or the fleet-wide one, which differ in their request
+// type and so share no interface that mentions it.
+type devMachineController interface {
+	DeferNextReconcileForObject(obj metav1.Object, reconcileAfter time.Time)
+}
+
 // DevMachine reconciles a DevMachine object.
 type DevMachine struct {
 	client.Client
-	controller capicontrollerutil.Controller
+	controller devMachineController
 
 	// WatchFilterValue is the label value used to filter events prior to reconciliation.
 	WatchFilterValue string
