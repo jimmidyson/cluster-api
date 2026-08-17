@@ -87,7 +87,6 @@ type multiclusterController struct {
 	// so there is no multicluster controller wrapping it. See buildWildcard.
 	mc mccontroller.TypedController[mcreconcile.Request]
 
-	//
 	// wildcard and clusterOf are set when the builder was given a fleet-spanning
 	// cache, and decide how WatchAllClusters registers.
 	wildcard  crcache.Cache
