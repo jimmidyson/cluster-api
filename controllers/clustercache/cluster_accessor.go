@@ -32,11 +32,22 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 )
 
 // clusterAccessor is the object used to create and manage connections to a specific workload cluster.
 type clusterAccessor struct {
 	cluster client.ObjectKey
+
+	// workspace is the logical cluster (kcp workspace, or other
+	// multicluster-runtime cluster) that holds this Cluster. Empty when the
+	// ClusterCache serves only one, which is the single-cluster case rather than
+	// a missing value.
+	//
+	// Carried here only so that metrics can be labelled with it: two logical
+	// clusters' identically named Clusters would otherwise share a time series.
+	workspace multicluster.ClusterName
 
 	// config is the config of the clusterAccessor.
 	config *clusterAccessorConfig
@@ -213,11 +224,12 @@ type clusterAccessorLockedHealthCheckingState struct {
 }
 
 // newClusterAccessor creates a new clusterAccessor.
-func newClusterAccessor(cacheCtx context.Context, cluster client.ObjectKey, clusterAccessorConfig *clusterAccessorConfig) *clusterAccessor {
+func newClusterAccessor(cacheCtx context.Context, key accessorKey, clusterAccessorConfig *clusterAccessorConfig) *clusterAccessor {
 	return &clusterAccessor{
-		cacheCtx: cacheCtx,
-		cluster:  cluster,
-		config:   clusterAccessorConfig,
+		cacheCtx:  cacheCtx,
+		cluster:   key.cluster,
+		workspace: key.workspace,
+		config:    clusterAccessorConfig,
 	}
 }
 
@@ -261,14 +273,14 @@ func (ca *clusterAccessor) Connect(ctx context.Context) (retErr error) {
 	defer func() {
 		if retErr != nil {
 			log.Error(retErr, "Connect failed", "duration", duration)
-			connectionUp.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace).Set(0)
+			connectionUp.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace, ca.workspace.String()).Set(0)
 			ca.lockedState.lastConnectionCreationErrorTime = time.Now()
 			// A client creation just failed, so let's count this as a failed probe.
 			ca.lockedState.healthChecking.lastProbeTime = time.Now()
 			// Note: Intentionally not modifying lastProbeSuccessTime.
 			ca.lockedState.healthChecking.consecutiveFailures++
 		} else {
-			connectionUp.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace).Set(1)
+			connectionUp.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace, ca.workspace.String()).Set(1)
 		}
 	}()
 
@@ -309,7 +321,7 @@ func (ca *clusterAccessor) Disconnect(ctx context.Context) {
 
 	defer func() {
 		ca.unlock(ctx)
-		connectionUp.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace).Set(0)
+		connectionUp.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace, ca.workspace.String()).Set(0)
 	}()
 	log.V(4).Info("Disconnecting")
 
@@ -355,20 +367,20 @@ func (ca *clusterAccessor) HealthCheck(ctx context.Context) (bool, bool) {
 		unauthorizedErrorOccurred = true
 		ca.lockedState.healthChecking.consecutiveFailures++
 		log.V(6).Info(fmt.Sprintf("Health probe failed (unauthorized error occurred): %v", err))
-		healthCheck.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace).Set(0)
-		healthChecksTotal.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace, "error").Inc()
+		healthCheck.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace, ca.workspace.String()).Set(0)
+		healthChecksTotal.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace, ca.workspace.String(), "error").Inc()
 	case err != nil:
 		ca.lockedState.healthChecking.consecutiveFailures++
 		log.V(6).Info(fmt.Sprintf("Health probe failed (%d/%d): %v",
 			ca.lockedState.healthChecking.consecutiveFailures, ca.config.HealthProbe.FailureThreshold, err))
-		healthCheck.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace).Set(0)
-		healthChecksTotal.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace, "error").Inc()
+		healthCheck.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace, ca.workspace.String()).Set(0)
+		healthChecksTotal.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace, ca.workspace.String(), "error").Inc()
 	default:
 		ca.lockedState.healthChecking.consecutiveFailures = 0
 		ca.lockedState.healthChecking.lastProbeSuccessTime = ca.lockedState.healthChecking.lastProbeTime
 		log.V(6).Info("Health probe succeeded")
-		healthCheck.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace).Set(1)
-		healthChecksTotal.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace, "success").Inc()
+		healthCheck.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace, ca.workspace.String()).Set(1)
+		healthChecksTotal.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace, ca.workspace.String(), "success").Inc()
 	}
 
 	tooManyConsecutiveFailures := ca.lockedState.healthChecking.consecutiveFailures >= ca.config.HealthProbe.FailureThreshold
