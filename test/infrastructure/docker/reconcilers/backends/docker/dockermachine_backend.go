@@ -323,7 +323,7 @@ func (r *MachineBackendReconciler) reconcileCGroups(ctx context.Context, dockerM
 	}
 
 	// run the WaitCGroupsTask or wait for its completion.
-	taskState := r.TaskManager.GetStatus(dockerMachine, WaitCGroupsTask)
+	taskState := r.TaskManager.GetStatus(ctx, dockerMachine, WaitCGroupsTask)
 	switch {
 	case taskState == nil:
 		// WaitCGroupsTask not yet performed, start it.
@@ -369,7 +369,7 @@ func (r *MachineBackendReconciler) reconcileCGroups(ctx context.Context, dockerM
 			Reason:  infrav1.DevMachineDockerCGroupsNotReadyReason,
 			Message: taskState.String(),
 		})
-		r.TaskManager.ResetStatus(dockerMachine, WaitCGroupsTask)
+		r.TaskManager.ResetStatus(ctx, dockerMachine, WaitCGroupsTask)
 		r.DeferNextReconcileForObject(dockerMachine, time.Now().Add(5*time.Second))
 	case taskState.Completed:
 		// WaitCGroupsTask completed, report state.
@@ -431,7 +431,7 @@ func (r *MachineBackendReconciler) reconcilePreLoadedImages(ctx context.Context,
 	}
 
 	// run the PreLoadImagesTask or wait for its completion.
-	taskState := r.TaskManager.GetStatus(dockerMachine, PreLoadImagesTask)
+	taskState := r.TaskManager.GetStatus(ctx, dockerMachine, PreLoadImagesTask)
 	switch {
 	case taskState == nil:
 		// PreLoadImagesTask not it performed, start it.
@@ -479,7 +479,7 @@ func (r *MachineBackendReconciler) reconcilePreLoadedImages(ctx context.Context,
 			Reason:  infrav1.DevMachineDockerPreLoadedImagesNotReadyReason,
 			Message: taskState.String(),
 		})
-		r.TaskManager.ResetStatus(dockerMachine, PreLoadImagesTask)
+		r.TaskManager.ResetStatus(ctx, dockerMachine, PreLoadImagesTask)
 		r.DeferNextReconcileForObject(dockerMachine, time.Now().Add(5*time.Second))
 	case taskState.Completed:
 		// PreLoadImagesTask completed, report state.
@@ -545,7 +545,7 @@ func (r *MachineBackendReconciler) reconcileBootstrap(ctx context.Context, machi
 	}
 
 	// run the CloudInitOrIgnitionTask or wait for its completion.
-	taskState := r.TaskManager.GetStatus(dockerMachine, CloudInitOrIgnitionTask)
+	taskState := r.TaskManager.GetStatus(ctx, dockerMachine, CloudInitOrIgnitionTask)
 	switch {
 	case taskState == nil:
 		log.Info("Checking for sentinel file")
@@ -845,7 +845,7 @@ func (r *MachineBackendReconciler) ReconcileDelete(ctx context.Context, cluster 
 	}
 
 	// Cancel all the provisioning tasks for this machine.
-	r.TaskManager.Cancel(dockerMachine)
+	r.TaskManager.Cancel(ctx, dockerMachine)
 
 	externalMachine, externalLoadBalancer, err := r.getExternalObjects(ctx, cluster, dockerCluster, machine, dockerMachine)
 	if err != nil {
