@@ -24,12 +24,12 @@ import (
 )
 
 // NewFakeClusterCache creates a new fake ClusterCache that can be used by unit tests.
-func NewFakeClusterCache(workloadClient client.Client, clusterKey client.ObjectKey, watchObjects ...string) ClusterCache {
+func NewFakeClusterCache(workloadClient client.Client, cluster client.ObjectKey, watchObjects ...string) ClusterCache {
 	testCacheTracker := &clusterCache{
-		clusterAccessors: make(map[client.ObjectKey]*clusterAccessor),
+		clusterAccessors: make(map[accessorKey]*clusterAccessor),
 	}
 
-	testCacheTracker.clusterAccessors[clusterKey] = &clusterAccessor{
+	testCacheTracker.clusterAccessors[accessorKey{cluster: cluster}] = &clusterAccessor{
 		lockedState: clusterAccessorLockedState{
 			connection: &clusterAccessorLockedConnectionState{
 				cachedClient:   workloadClient,

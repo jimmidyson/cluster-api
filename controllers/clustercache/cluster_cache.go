@@ -43,6 +43,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
+	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
+
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	capicontrollerutil "sigs.k8s.io/cluster-api/util/controller"
 	"sigs.k8s.io/cluster-api/util/predicates"
@@ -331,7 +333,7 @@ func SetupWithManager(ctx context.Context, mgr manager.Manager, options Options,
 	cc := &clusterCache{
 		client:                mgr.GetClient(),
 		clusterAccessorConfig: buildClusterAccessorConfig(mgr.GetScheme(), options, controllerPodMetadata),
-		clusterAccessors:      make(map[client.ObjectKey]*clusterAccessor),
+		clusterAccessors:      make(map[accessorKey]*clusterAccessor),
 		cacheCtx:              cacheCtx,
 		cacheCtxCancel:        cacheCtxCancel,
 	}
@@ -359,7 +361,7 @@ type clusterCache struct {
 	// clusterAccessorsLock is used to synchronize access to clusterAccessors.
 	clusterAccessorsLock sync.RWMutex
 	// clusterAccessors is the map of clusterAccessors by cluster.
-	clusterAccessors map[client.ObjectKey]*clusterAccessor
+	clusterAccessors map[accessorKey]*clusterAccessor
 
 	// clusterSourcesLock is used to synchronize access to clusterSources.
 	clusterSourcesLock sync.RWMutex
@@ -386,19 +388,25 @@ type clusterSource struct {
 	// controllerName is the name of the controller that will watch this source.
 	controllerName string
 
-	// ch is the channel on which to send events.
-	ch chan event.GenericEvent
+	// send delivers one Cluster event to whoever registered this source.
+	//
+	// A function rather than the channel it used to be, because the two kinds
+	// of consumer need different things: a single-cluster source enqueues a
+	// plain request, and a fleet-wide one has to say which logical cluster the
+	// event came from. Both are constructed next to the source that needs them,
+	// and neither can be derived from the Cluster object alone.
+	send func(ctx context.Context, workspace multicluster.ClusterName, cluster *clusterv1.Cluster)
 
 	// sendEventAfterProbeFailureDurations are the durations after LastProbeSuccessTime
 	// after which we have to send events.
 	sendEventAfterProbeFailureDurations []time.Duration
 
 	// lastEventSentTimeByCluster are the times when we last sent an event for a cluster.
-	lastEventSentTimeByCluster map[client.ObjectKey]time.Time
+	lastEventSentTimeByCluster map[accessorKey]time.Time
 }
 
 func (cc *clusterCache) GetClient(ctx context.Context, cluster client.ObjectKey) (client.Client, error) {
-	accessor := cc.getClusterAccessor(cluster)
+	accessor := cc.getClusterAccessor(keyFor(ctx, cluster))
 	if accessor == nil {
 		return nil, pkgerrors.WithMessage(ErrClusterNotConnected, "error getting client")
 	}
@@ -406,7 +414,7 @@ func (cc *clusterCache) GetClient(ctx context.Context, cluster client.ObjectKey)
 }
 
 func (cc *clusterCache) GetReader(ctx context.Context, cluster client.ObjectKey) (client.Reader, error) {
-	accessor := cc.getClusterAccessor(cluster)
+	accessor := cc.getClusterAccessor(keyFor(ctx, cluster))
 	if accessor == nil {
 		return nil, pkgerrors.WithMessage(ErrClusterNotConnected, "error getting client reader")
 	}
@@ -416,7 +424,7 @@ func (cc *clusterCache) GetReader(ctx context.Context, cluster client.ObjectKey)
 // GetUncachedClient returns a live (uncached) client for the given cluster.
 // If there is no connection to the workload cluster ErrClusterNotConnected will be returned.
 func (cc *clusterCache) GetUncachedClient(ctx context.Context, cluster client.ObjectKey) (client.Client, error) {
-	accessor := cc.getClusterAccessor(cluster)
+	accessor := cc.getClusterAccessor(keyFor(ctx, cluster))
 	if accessor == nil {
 		return nil, pkgerrors.WithMessage(ErrClusterNotConnected, "error getting uncached client")
 	}
@@ -424,7 +432,7 @@ func (cc *clusterCache) GetUncachedClient(ctx context.Context, cluster client.Ob
 }
 
 func (cc *clusterCache) GetRESTConfig(ctx context.Context, cluster client.ObjectKey) (*rest.Config, error) {
-	accessor := cc.getClusterAccessor(cluster)
+	accessor := cc.getClusterAccessor(keyFor(ctx, cluster))
 	if accessor == nil {
 		return nil, pkgerrors.WithMessage(ErrClusterNotConnected, "error getting REST config")
 	}
@@ -432,7 +440,7 @@ func (cc *clusterCache) GetRESTConfig(ctx context.Context, cluster client.Object
 }
 
 func (cc *clusterCache) Watch(ctx context.Context, cluster client.ObjectKey, watcher Watcher) error {
-	accessor := cc.getClusterAccessor(cluster)
+	accessor := cc.getClusterAccessor(keyFor(ctx, cluster))
 	if accessor == nil {
 		return pkgerrors.WithMessagef(ErrClusterNotConnected, "error creating watch %s for %T", watcher.Name(), watcher.Object())
 	}
@@ -440,7 +448,7 @@ func (cc *clusterCache) Watch(ctx context.Context, cluster client.ObjectKey, wat
 }
 
 func (cc *clusterCache) GetHealthCheckingState(ctx context.Context, cluster client.ObjectKey) HealthCheckingState {
-	accessor := cc.getClusterAccessor(cluster)
+	accessor := cc.getClusterAccessor(keyFor(ctx, cluster))
 	if accessor == nil {
 		return HealthCheckingState{}
 	}
@@ -455,13 +463,13 @@ const (
 // Reconcile reconciles the passed in object.
 func (cc *clusterCache) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	log := ctrl.LoggerFrom(ctx)
-	clusterKey := client.ObjectKey{Namespace: req.Namespace, Name: req.Name}
+	key := keyFor(ctx, client.ObjectKey{Namespace: req.Namespace, Name: req.Name})
 
 	cluster := &clusterv1.Cluster{}
 	if err := cc.client.Get(ctx, req.NamespacedName, cluster); err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Info("Cluster has been deleted, disconnecting")
-			cc.cleanupForCluster(ctx, clusterKey)
+			cc.cleanupForCluster(ctx, key)
 			return ctrl.Result{}, nil
 		}
 
@@ -473,11 +481,11 @@ func (cc *clusterCache) Reconcile(ctx context.Context, req reconcile.Request) (r
 	// Apply cluster filter if set
 	if cc.clusterFilter != nil && !cc.clusterFilter(cluster) {
 		log.V(6).Info("Cluster filtered out by ClusterFilter, not connecting")
-		cc.cleanupForCluster(ctx, clusterKey)
+		cc.cleanupForCluster(ctx, key)
 		return ctrl.Result{}, nil
 	}
 
-	accessor := cc.getOrCreateClusterAccessor(clusterKey)
+	accessor := cc.getOrCreateClusterAccessor(key)
 
 	// Return if infrastructure is not ready yet to avoid trying to open a connection when it cannot succeed.
 	// Requeue is not needed as there will be a new reconcile.Request when Cluster.status.initialization.infrastructureProvisioned is set.
@@ -570,33 +578,33 @@ func (cc *clusterCache) Reconcile(ctx context.Context, req reconcile.Request) (r
 // Note: This method should only be called in the ClusterCache Reconcile method. Otherwise it could happen
 // that a new clusterAccessor is created even after ClusterCache Reconcile deleted the clusterAccessor after
 // Cluster object deletion.
-func (cc *clusterCache) getOrCreateClusterAccessor(cluster client.ObjectKey) *clusterAccessor {
+func (cc *clusterCache) getOrCreateClusterAccessor(key accessorKey) *clusterAccessor {
 	cc.clusterAccessorsLock.Lock()
 	defer cc.clusterAccessorsLock.Unlock()
 
-	accessor, ok := cc.clusterAccessors[cluster]
+	accessor, ok := cc.clusterAccessors[key]
 	if !ok {
-		accessor = newClusterAccessor(cc.cacheCtx, cluster, cc.clusterAccessorConfig)
-		cc.clusterAccessors[cluster] = accessor
+		accessor = newClusterAccessor(cc.cacheCtx, key, cc.clusterAccessorConfig)
+		cc.clusterAccessors[key] = accessor
 	}
 
 	return accessor
 }
 
 // getClusterAccessor returns a clusterAccessor if it exists, otherwise nil.
-func (cc *clusterCache) getClusterAccessor(cluster client.ObjectKey) *clusterAccessor {
+func (cc *clusterCache) getClusterAccessor(key accessorKey) *clusterAccessor {
 	cc.clusterAccessorsLock.RLock()
 	defer cc.clusterAccessorsLock.RUnlock()
 
-	return cc.clusterAccessors[cluster]
+	return cc.clusterAccessors[key]
 }
 
 // deleteClusterAccessor deletes the clusterAccessor for the given cluster in the clusterAccessors map.
-func (cc *clusterCache) deleteClusterAccessor(cluster client.ObjectKey) {
+func (cc *clusterCache) deleteClusterAccessor(key accessorKey) {
 	cc.clusterAccessorsLock.Lock()
 	defer cc.clusterAccessorsLock.Unlock()
 
-	delete(cc.clusterAccessors, cluster)
+	delete(cc.clusterAccessors, key)
 }
 
 // shouldRequeue calculates if we should requeue based on the lastExecutionTime and the interval.
@@ -628,30 +636,31 @@ func minDurationOrDefault(durations []time.Duration, defaultDuration time.Durati
 	return d
 }
 
-func (cc *clusterCache) cleanupClusterSourcesForCluster(cluster client.ObjectKey) {
+func (cc *clusterCache) cleanupClusterSourcesForCluster(key accessorKey) {
 	cc.clusterSourcesLock.Lock()
 	defer cc.clusterSourcesLock.Unlock()
 
 	for _, cs := range cc.clusterSources {
-		delete(cs.lastEventSentTimeByCluster, cluster)
+		delete(cs.lastEventSentTimeByCluster, key)
 	}
 }
 
-func (cc *clusterCache) cleanupMetricsForCluster(cluster client.ObjectKey) {
-	healthCheck.DeleteLabelValues(cluster.Name, cluster.Namespace)
-	connectionUp.DeleteLabelValues(cluster.Name, cluster.Namespace)
-	healthChecksTotal.DeleteLabelValues(cluster.Name, cluster.Namespace, "success")
-	healthChecksTotal.DeleteLabelValues(cluster.Name, cluster.Namespace, "error")
+func (cc *clusterCache) cleanupMetricsForCluster(key accessorKey) {
+	cluster, workspace := key.cluster, key.workspace.String()
+	healthCheck.DeleteLabelValues(cluster.Name, cluster.Namespace, workspace)
+	connectionUp.DeleteLabelValues(cluster.Name, cluster.Namespace, workspace)
+	healthChecksTotal.DeleteLabelValues(cluster.Name, cluster.Namespace, workspace, "success")
+	healthChecksTotal.DeleteLabelValues(cluster.Name, cluster.Namespace, workspace, "error")
 }
 
-func (cc *clusterCache) cleanupForCluster(ctx context.Context, cluster client.ObjectKey) {
-	accessor := cc.getClusterAccessor(cluster)
+func (cc *clusterCache) cleanupForCluster(ctx context.Context, key accessorKey) {
+	accessor := cc.getClusterAccessor(key)
 	if accessor != nil {
 		accessor.Disconnect(ctx)
 	}
-	cc.deleteClusterAccessor(cluster)
-	cc.cleanupClusterSourcesForCluster(cluster)
-	cc.cleanupMetricsForCluster(cluster)
+	cc.deleteClusterAccessor(key)
+	cc.cleanupClusterSourcesForCluster(key)
+	cc.cleanupMetricsForCluster(key)
 }
 
 func (cc *clusterCache) GetClusterSource(controllerName string, mapFunc func(ctx context.Context, cluster client.Object) []ctrl.Request, opts ...GetClusterSourceOption) source.Source {
@@ -661,15 +670,21 @@ func (cc *clusterCache) GetClusterSource(controllerName string, mapFunc func(ctx
 	getClusterSourceOptions := &GetClusterSourceOptions{}
 	getClusterSourceOptions.ApplyOptions(opts)
 
+	ch := make(chan event.GenericEvent)
 	cs := clusterSource{
-		controllerName:                      controllerName,
-		ch:                                  make(chan event.GenericEvent),
+		controllerName: controllerName,
+		// The send is unchanged from when this was the channel itself: a
+		// blocking send on an unbuffered channel, which is what makes the
+		// reconcile that produced the event wait for the source to take it.
+		send: func(_ context.Context, _ multicluster.ClusterName, cluster *clusterv1.Cluster) {
+			ch <- event.GenericEvent{Object: cluster}
+		},
 		sendEventAfterProbeFailureDurations: getClusterSourceOptions.watchForProbeFailures,
-		lastEventSentTimeByCluster:          map[client.ObjectKey]time.Time{},
+		lastEventSentTimeByCluster:          map[accessorKey]time.Time{},
 	}
 	cc.clusterSources = append(cc.clusterSources, cs)
 
-	return source.Channel(cs.ch, handler.TypedEnqueueRequestsFromMapFunc(mapFunc))
+	return source.Channel(ch, handler.TypedEnqueueRequestsFromMapFunc(mapFunc))
 }
 
 func (cc *clusterCache) sendEventsToClusterSources(ctx context.Context, cluster *clusterv1.Cluster, now, lastProbeSuccessTime time.Time, didConnect, didDisconnect bool) {
@@ -678,17 +693,15 @@ func (cc *clusterCache) sendEventsToClusterSources(ctx context.Context, cluster 
 	cc.clusterSourcesLock.Lock()
 	defer cc.clusterSourcesLock.Unlock()
 
-	clusterKey := client.ObjectKeyFromObject(cluster)
+	key := keyFor(ctx, client.ObjectKeyFromObject(cluster))
 
 	for _, cs := range cc.clusterSources {
-		lastEventSentTime := cs.lastEventSentTimeByCluster[clusterKey]
+		lastEventSentTime := cs.lastEventSentTimeByCluster[key]
 
 		if reasons := shouldSendEvent(now, lastProbeSuccessTime, lastEventSentTime, didConnect, didDisconnect, cs.sendEventAfterProbeFailureDurations); len(reasons) > 0 {
 			log.V(6).Info("Sending Cluster event", "targetController", cs.controllerName, "reasons", strings.Join(reasons, ", "))
-			cs.ch <- event.GenericEvent{
-				Object: cluster,
-			}
-			cs.lastEventSentTimeByCluster[clusterKey] = now
+			cs.send(ctx, key.workspace, cluster)
+			cs.lastEventSentTimeByCluster[key] = now
 		}
 	}
 }

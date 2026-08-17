@@ -42,9 +42,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	"sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	"sigs.k8s.io/cluster-api/controllers/remote"
@@ -90,7 +91,7 @@ func TestReconcile(t *testing.T) {
 		// Use APIReader to avoid cache issues when reading the Cluster object.
 		client:                env.GetAPIReader(),
 		clusterAccessorConfig: accessorConfig,
-		clusterAccessors:      make(map[client.ObjectKey]*clusterAccessor),
+		clusterAccessors:      make(map[accessorKey]*clusterAccessor),
 		cacheCtx:              context.Background(),
 		clusterFilter: func(cluster *clusterv1.Cluster) bool {
 			return (cluster.ObjectMeta.Labels["cluster.x-k8s.io/included-in-clustercache-tests"] == "true")
@@ -163,7 +164,7 @@ func TestReconcile(t *testing.T) {
 	g.Expect(res.RequeueAfter <= accessorConfig.ConnectionCreationRetryInterval).To(BeTrue())
 
 	// Set lastConnectionCreationErrorTime to now - ConnectionCreationRetryInterval to skip over rate-limiting
-	cc.getClusterAccessor(clusterKey).lockedState.lastConnectionCreationErrorTime = time.Now().Add(-1 * accessorConfig.ConnectionCreationRetryInterval)
+	cc.getClusterAccessor(accessorKey{cluster: clusterKey}).lockedState.lastConnectionCreationErrorTime = time.Now().Add(-1 * accessorConfig.ConnectionCreationRetryInterval)
 
 	// Reconcile again, accessor.Connect works now
 	// => because accessor.Connect just set the lastProbeTime we expect a retry with
@@ -172,7 +173,7 @@ func TestReconcile(t *testing.T) {
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(res.RequeueAfter >= accessorConfig.HealthProbe.Interval-2*time.Second).To(BeTrue())
 	g.Expect(res.RequeueAfter <= accessorConfig.HealthProbe.Interval).To(BeTrue())
-	g.Expect(cc.getClusterAccessor(clusterKey).Connected(ctx)).To(BeTrue())
+	g.Expect(cc.getClusterAccessor(accessorKey{cluster: clusterKey}).Connected(ctx)).To(BeTrue())
 
 	// Reconcile again
 	// => we still expect a retry with slightly less than HealthProbe.Interval
@@ -182,8 +183,8 @@ func TestReconcile(t *testing.T) {
 	g.Expect(res.RequeueAfter <= accessorConfig.HealthProbe.Interval).To(BeTrue())
 
 	// Set last probe times to now - accessorConfig.HealthProbe.Interval to skip over rate-limiting
-	cc.getClusterAccessor(clusterKey).lockedState.healthChecking.lastProbeTime = time.Now().Add(-1 * accessorConfig.HealthProbe.Interval)
-	cc.getClusterAccessor(clusterKey).lockedState.healthChecking.lastProbeSuccessTime = time.Now().Add(-1 * accessorConfig.HealthProbe.Interval)
+	cc.getClusterAccessor(accessorKey{cluster: clusterKey}).lockedState.healthChecking.lastProbeTime = time.Now().Add(-1 * accessorConfig.HealthProbe.Interval)
+	cc.getClusterAccessor(accessorKey{cluster: clusterKey}).lockedState.healthChecking.lastProbeSuccessTime = time.Now().Add(-1 * accessorConfig.HealthProbe.Interval)
 
 	// Reconcile again, now the health probe will be run successfully
 	// => so we expect a retry with slightly less than HealthProbe.Interval
@@ -191,11 +192,11 @@ func TestReconcile(t *testing.T) {
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(res.RequeueAfter >= accessorConfig.HealthProbe.Interval-2*time.Second).To(BeTrue())
 	g.Expect(res.RequeueAfter <= accessorConfig.HealthProbe.Interval).To(BeTrue())
-	g.Expect(cc.getClusterAccessor(clusterKey).Connected(ctx)).To(BeTrue())
-	g.Expect(cc.getClusterAccessor(clusterKey).lockedState.healthChecking.consecutiveFailures).To(Equal(0))
+	g.Expect(cc.getClusterAccessor(accessorKey{cluster: clusterKey}).Connected(ctx)).To(BeTrue())
+	g.Expect(cc.getClusterAccessor(accessorKey{cluster: clusterKey}).lockedState.healthChecking.consecutiveFailures).To(Equal(0))
 
 	// Exchange the REST client, so the next health probe will return an unauthorized error
-	cc.getClusterAccessor(clusterKey).lockedState.connection.restClient = &fake.RESTClient{
+	cc.getClusterAccessor(accessorKey{cluster: clusterKey}).lockedState.connection.restClient = &fake.RESTClient{
 		NegotiatedSerializer: scheme.Codecs,
 		Resp: &http.Response{
 			StatusCode: http.StatusUnauthorized,
@@ -204,8 +205,8 @@ func TestReconcile(t *testing.T) {
 		},
 	}
 	// Set last probe times to now - accessorConfig.HealthProbe.Interval to skip over rate-limiting
-	cc.getClusterAccessor(clusterKey).lockedState.healthChecking.lastProbeTime = time.Now().Add(-1 * accessorConfig.HealthProbe.Interval)
-	cc.getClusterAccessor(clusterKey).lockedState.healthChecking.lastProbeSuccessTime = time.Now().Add(-1 * accessorConfig.HealthProbe.Interval)
+	cc.getClusterAccessor(accessorKey{cluster: clusterKey}).lockedState.healthChecking.lastProbeTime = time.Now().Add(-1 * accessorConfig.HealthProbe.Interval)
+	cc.getClusterAccessor(accessorKey{cluster: clusterKey}).lockedState.healthChecking.lastProbeSuccessTime = time.Now().Add(-1 * accessorConfig.HealthProbe.Interval)
 
 	// Reconcile again, now the health probe will fail
 	// => so we expect a disconnect and an immediate retry.
@@ -214,12 +215,12 @@ func TestReconcile(t *testing.T) {
 	g.Expect(res).To(Equal(reconcile.Result{RequeueAfter: 1 * time.Millisecond}))
 
 	// At this point there should still be a cluster accessor, but it is disconnected
-	_, ok := cc.clusterAccessors[clusterKey]
+	_, ok := cc.clusterAccessors[accessorKey{cluster: clusterKey}]
 	g.Expect(ok).To(BeTrue())
-	g.Expect(cc.getClusterAccessor(clusterKey).Connected(ctx)).To(BeFalse())
+	g.Expect(cc.getClusterAccessor(accessorKey{cluster: clusterKey}).Connected(ctx)).To(BeFalse())
 	// There should be one cluster source with an entry for lastEventSentTime for the current cluster.
 	g.Expect(cc.clusterSources).To(HaveLen(1))
-	_, ok = cc.clusterSources[0].lastEventSentTimeByCluster[clusterKey]
+	_, ok = cc.clusterSources[0].lastEventSentTimeByCluster[accessorKey{cluster: clusterKey}]
 	g.Expect(ok).To(BeTrue())
 
 	// Delete the Cluster
@@ -232,11 +233,11 @@ func TestReconcile(t *testing.T) {
 	g.Expect(res.IsZero()).To(BeTrue())
 
 	// Cluster accessor should have been removed
-	_, ok = cc.clusterAccessors[clusterKey]
+	_, ok = cc.clusterAccessors[accessorKey{cluster: clusterKey}]
 	g.Expect(ok).To(BeFalse())
 	// lastEventSentTime in cluster source for the current cluster should have been removed.
 	g.Expect(cc.clusterSources).To(HaveLen(1))
-	_, ok = cc.clusterSources[0].lastEventSentTimeByCluster[clusterKey]
+	_, ok = cc.clusterSources[0].lastEventSentTimeByCluster[accessorKey{cluster: clusterKey}]
 	g.Expect(ok).To(BeFalse())
 
 	// Verify Cluster queue.
@@ -451,8 +452,6 @@ func TestSendEventsToClusterSources(t *testing.T) {
 			g := NewWithT(t)
 
 			gotEventsToController := []string{}
-			var lock sync.Mutex
-			var wg sync.WaitGroup
 
 			cc := &clusterCache{}
 			for i, cs := range tt.clusterSources {
@@ -465,30 +464,20 @@ func TestSendEventsToClusterSources(t *testing.T) {
 					return []ctrl.Request{{NamespacedName: client.ObjectKeyFromObject(o)}}
 				}, opts...)).ToNot(BeNil())
 
-				cc.clusterSources[i].lastEventSentTimeByCluster[client.ObjectKeyFromObject(testCluster)] = cs.lastEventSentTime
+				cc.clusterSources[i].lastEventSentTimeByCluster[accessorKey{cluster: client.ObjectKeyFromObject(testCluster)}] = cs.lastEventSentTime
 
-				// Create go routine to read events from source and store them in gotEventsToController
-				wg.Add(1)
-				go func(ch <-chan event.GenericEvent) {
-					for {
-						_, ok := <-ch
-						if !ok {
-							wg.Done()
-							return
-						}
-						lock.Lock()
-						gotEventsToController = append(gotEventsToController, cs.controllerName)
-						lock.Unlock()
-					}
-				}(cc.clusterSources[i].ch)
+				// Record deliveries in place of the source's own send. What this
+				// test is about is which controllers are told, not how they are
+				// told, and substituting the send makes that synchronous — the
+				// channel readers it replaces were only there to unblock the
+				// unbuffered sends.
+				controllerName := cs.controllerName
+				cc.clusterSources[i].send = func(context.Context, multicluster.ClusterName, *clusterv1.Cluster) {
+					gotEventsToController = append(gotEventsToController, controllerName)
+				}
 			}
 
 			cc.sendEventsToClusterSources(ctx, testCluster, tt.now, tt.lastProbeSuccessTime, tt.didConnect, tt.didDisconnect)
-
-			for _, cs := range cc.clusterSources {
-				close(cs.ch)
-			}
-			wg.Wait()
 
 			g.Expect(gotEventsToController).To(ConsistOf(tt.wantEventsToControllers))
 		})
@@ -651,7 +640,7 @@ func TestClusterCacheConcurrency(t *testing.T) {
 	// Otherwise we e.g. can't assume below that every working cluster is already connected.
 	g.Eventually(func(g Gomega) {
 		for _, tc := range testClusters {
-			accessor := internalClusterCache.getClusterAccessor(tc.cluster)
+			accessor := internalClusterCache.getClusterAccessor(accessorKey{cluster: tc.cluster})
 			g.Expect(accessor).ToNot(BeNil())
 			if tc.brokenRESTConfig {
 				g.Expect(accessor.GetLastConnectionCreationErrorTime(ctx).IsZero()).To(BeFalse())
@@ -696,7 +685,7 @@ func TestClusterCacheConcurrency(t *testing.T) {
 						continue
 					}
 
-					accessor := internalClusterCache.getClusterAccessor(tc.cluster)
+					accessor := internalClusterCache.getClusterAccessor(accessorKey{cluster: tc.cluster})
 					if accessor.Connected(ctx) {
 						errChan <- pkgerrors.Errorf("cluster %s: expected accessor to not be connected", tc.cluster)
 						continue
@@ -719,7 +708,7 @@ func TestClusterCacheConcurrency(t *testing.T) {
 						continue
 					}
 
-					accessor := internalClusterCache.getClusterAccessor(tc.cluster)
+					accessor := internalClusterCache.getClusterAccessor(accessorKey{cluster: tc.cluster})
 					if !accessor.Connected(ctx) {
 						errChan <- pkgerrors.Errorf("cluster %s: expected accessor to be connected", tc.cluster)
 						continue

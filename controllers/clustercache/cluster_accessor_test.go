@@ -75,7 +75,7 @@ func TestConnect(t *testing.T) {
 			Indexes: []CacheOptionsIndex{NodeProviderIDIndex},
 		},
 	}, nil)
-	accessor := newClusterAccessor(context.Background(), clusterKey, config)
+	accessor := newClusterAccessor(context.Background(), accessorKey{cluster: clusterKey}, config)
 
 	// Before connect, getting the uncached client should fail with ErrClusterNotConnected
 	_, err := accessor.GetUncachedClient(ctx)
@@ -203,7 +203,7 @@ func TestDisconnect(t *testing.T) {
 			Timeout:   10 * time.Second,
 		},
 	}, nil)
-	accessor := newClusterAccessor(context.Background(), clusterKey, config)
+	accessor := newClusterAccessor(context.Background(), accessorKey{cluster: clusterKey}, config)
 
 	// Connect (so we can disconnect afterward)
 	g.Expect(accessor.Connect(ctx)).To(Succeed())
@@ -314,7 +314,7 @@ func TestHealthCheck(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			g := NewWithT(t)
 
-			accessor := newClusterAccessor(context.Background(), clusterKey, &clusterAccessorConfig{
+			accessor := newClusterAccessor(context.Background(), accessorKey{cluster: clusterKey}, &clusterAccessorConfig{
 				HealthProbe: &clusterAccessorHealthProbeConfig{
 					Timeout:          5 * time.Second,
 					FailureThreshold: 5,
@@ -374,7 +374,7 @@ func TestWatch(t *testing.T) {
 			Timeout:   10 * time.Second,
 		},
 	}, nil)
-	accessor := newClusterAccessor(context.Background(), clusterKey, config)
+	accessor := newClusterAccessor(context.Background(), accessorKey{cluster: clusterKey}, config)
 
 	tw := &testWatcher{}
 	wi := WatcherOptions{
@@ -444,7 +444,7 @@ func TestConnectWithDefaultTransform(t *testing.T) {
 			DefaultTransform: cache.TransformStripManagedFields(),
 		},
 	}, nil)
-	accessor := newClusterAccessor(context.Background(), clusterKey, config)
+	accessor := newClusterAccessor(context.Background(), accessorKey{cluster: clusterKey}, config)
 	g.Expect(accessor.Connect(ctx)).To(Succeed())
 	defer accessor.Disconnect(ctx)
 
