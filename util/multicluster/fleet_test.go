@@ -55,6 +55,7 @@ import (
 
 	mccontext "sigs.k8s.io/multicluster-runtime/pkg/context"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+	mcmulticluster "sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 	namespaceprovider "sigs.k8s.io/multicluster-runtime/providers/namespace"
 
@@ -244,4 +245,121 @@ func mustCreateConfigMap(ctx context.Context, g *WithT, c client.Client, namespa
 		cm.Labels = map[string]string{fanoutLabel: "true"}
 	}
 	t.Expect(client.IgnoreAlreadyExists(c.Create(ctx, cm))).To(Succeed())
+}
+
+// countingReconciler records how many times each request was reconciled, and
+// reads through the client it is given so that an unresolvable cluster surfaces
+// as a reconcile error rather than as silence.
+type countingReconciler struct {
+	client client.Client
+
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+func (r *countingReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+	r.mu.Lock()
+	r.counts[req.Name]++
+	r.mu.Unlock()
+
+	cm := &corev1.ConfigMap{}
+	if err := r.client.Get(ctx, req.NamespacedName, cm); err != nil {
+		return reconcile.Result{}, client.IgnoreNotFound(err)
+	}
+	return reconcile.Result{}, nil
+}
+
+func (r *countingReconciler) count(name string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.counts[name]
+}
+
+// TestWildcardSourceDropsUnresolvableClusters covers the failure mode wildcard
+// registration introduces.
+//
+// A per-cluster source only fires for clusters the provider has engaged, so a
+// request naming a cluster the provider does not have could not arise. One
+// shared registration sees every object the endpoint serves, so it can — and
+// under kcp it routinely will, because a workspace can bind an APIExport before
+// the provider engages it.
+//
+// Unhandled, each such request retries with backoff forever. What stops it is
+// mcreconcile.NewClusterNotFoundWrapper, which the multicluster builder applies
+// and which the wildcard path has to apply itself; and that only works if
+// ErrClusterNotFound survives every wrapping between the client that raises it
+// and the wrapper that reads it — the cluster-aware client's, the reconciler
+// wrapper's, and the cluster-in-context adapter's.
+//
+// This asserts the end of that chain rather than any link in it.
+func TestWildcardSourceDropsUnresolvableClusters(t *testing.T) {
+	g := NewWithT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	raw, err := client.New(restConfig, client.Options{Scheme: scheme.Scheme})
+	g.Expect(err).ToNot(HaveOccurred())
+
+	const ns = "wildcard-drop"
+	g.Expect(client.IgnoreAlreadyExists(raw.Create(ctx, &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: ns},
+	}))).To(Succeed())
+
+	hostCluster, err := cluster.New(restConfig, func(o *cluster.Options) { o.Scheme = scheme.Scheme })
+	g.Expect(err).ToNot(HaveOccurred())
+	provider := namespaceprovider.New(hostCluster)
+
+	mgr, err := mcmanager.New(restConfig, provider, manager.Options{
+		Scheme:         scheme.Scheme,
+		Metrics:        server.Options{BindAddress: "0"},
+		LeaderElection: false,
+	})
+	g.Expect(err).ToNot(HaveOccurred())
+
+	r := &countingReconciler{
+		client: capimulticluster.NewClusterAwareClient(mgr),
+		counts: map[string]int{},
+	}
+
+	// The resolver lies for one object, which is the whole point: it is the
+	// cheapest faithful stand-in for a workspace the provider has not engaged,
+	// and it does not require racing the provider to produce one.
+	const unresolvable = "names-a-cluster-that-does-not-exist"
+	clusterOf := func(o client.Object) (mcmulticluster.ClusterName, bool) {
+		if o.GetName() == unresolvable {
+			return "no-such-cluster", true
+		}
+		return mcmulticluster.ClusterName(o.GetNamespace()), o.GetNamespace() != ""
+	}
+
+	_, err = capicontrollerutil.NewMulticlusterControllerManagedBy(mgr, ctrl.Log.WithName("wildcard-drop")).
+		WithWildcardCache(mgr.GetLocalManager().GetCache(), clusterOf).
+		For(&corev1.ConfigMap{}).
+		Named("wildcard-drop").
+		WithOptions(controller.TypedOptions[mcreconcile.Request]{MaxConcurrentReconciles: 2}).
+		Build(ctx, r)
+	g.Expect(err).ToNot(HaveOccurred())
+
+	go func() { _ = hostCluster.Start(ctx) }()
+	go func() { _ = mgr.Start(ctx) }()
+
+	mustCreateConfigMap(ctx, g, raw, ns, "resolvable", map[string]string{"owner": ns}, false)
+	mustCreateConfigMap(ctx, g, raw, ns, unresolvable, map[string]string{"owner": ns}, false)
+
+	// The resolvable one proves the wildcard registration is live, so that the
+	// assertion below is about dropping rather than about nothing having
+	// happened at all.
+	g.Eventually(func() int { return r.count("resolvable") }, 30*time.Second, 100*time.Millisecond).
+		Should(BeNumerically(">=", 1))
+
+	// The unresolvable one is reconciled, fails to resolve its cluster, and is
+	// not retried. A single-figure count is the assertion: retries with backoff
+	// would climb without bound, and the count is deliberately not pinned to
+	// exactly one, because the informer may legitimately deliver more than one
+	// event for the object.
+	g.Eventually(func() int { return r.count(unresolvable) }, 30*time.Second, 100*time.Millisecond).
+		Should(BeNumerically(">=", 1))
+	settled := r.count(unresolvable)
+	g.Consistently(func() int { return r.count(unresolvable) }, 5*time.Second, 250*time.Millisecond).
+		Should(BeNumerically("<=", settled), "an unresolvable cluster is being retried rather than dropped")
 }
