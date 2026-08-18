@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -90,10 +91,14 @@ type multiclusterController struct {
 	// so there is no multicluster controller wrapping it. See buildWildcard.
 	mc mccontroller.TypedController[mcreconcile.Request]
 
-	// wildcard and clusterOf are set when the builder was given a fleet-spanning
-	// cache, and decide how WatchAllClusters registers.
-	wildcard  crcache.Cache
+	// registry and clusterOf are set when the builder was given a wildcard
+	// registry, and decide how WatchAllClusters registers.
+	registry  *WildcardRegistry
 	clusterOf capimulticluster.ClusterResolver
+
+	// name identifies this controller in the registry's errors, which is the
+	// only place a registration failure surfaces.
+	name string
 }
 
 func (c *multiclusterController) MultiClusterWatch(src mcsource.TypedSource[client.Object, mcreconcile.Request]) error {
@@ -105,8 +110,15 @@ func (c *multiclusterController) MultiClusterWatch(src mcsource.TypedSource[clie
 }
 
 func (c *multiclusterController) WatchAllClusters(obj client.Object, h handler.TypedEventHandler[client.Object, reconcile.Request], predicates ...predicate.Predicate) error {
-	if c.wildcard != nil {
-		return c.TypedController.Watch(capimulticluster.WildcardSource(c.wildcard, obj, h, c.clusterOf, predicates...))
+	if c.registry != nil {
+		// Through the registry rather than against one cache, for the same
+		// reason the declared watches go through it: a runtime watch registered
+		// while only one shard's cache existed would see that shard for ever.
+		// The contract-versioned references the core reconcilers resolve are
+		// added exactly this way.
+		return c.registry.add(fmt.Sprintf("%s's runtime watch on %T", c.name, obj), func(wildcard crcache.Cache) error {
+			return c.TypedController.Watch(capimulticluster.WildcardSource(wildcard, obj, h, c.clusterOf, predicates...))
+		})
 	}
 	typed := make([]predicate.TypedPredicate[client.Object], 0, len(predicates))
 	for _, p := range predicates {
@@ -156,9 +168,9 @@ type MulticlusterBuilder struct {
 	controllerName    string
 	rateLimitInterval time.Duration
 
-	// wildcard, when set, replaces per-cluster watch registration with one
-	// registration per type for the whole fleet. See WithWildcardCache.
-	wildcard        crcache.Cache
+	// registry, when set, replaces per-cluster watch registration with one
+	// registration per type per fleet-spanning cache. See WithWildcardRegistry.
+	registry        *WildcardRegistry
 	clusterOf       capimulticluster.ClusterResolver
 	wildcardWatches []wildcardWatch
 	globalPredicate predicate.Predicate
@@ -203,8 +215,8 @@ type wildcardWatch struct {
 // clusters — under kcp, one built against a /clusters/* endpoint — and objects
 // out of it have to be attributable to a cluster, which is what clusterOf does.
 // Both are properties of the provider, so both are supplied.
-func (blder *MulticlusterBuilder) WithWildcardCache(c crcache.Cache, clusterOf capimulticluster.ClusterResolver) *MulticlusterBuilder {
-	blder.wildcard = c
+func (blder *MulticlusterBuilder) WithWildcardRegistry(r *WildcardRegistry, clusterOf capimulticluster.ClusterResolver) *MulticlusterBuilder {
+	blder.registry = r
 	blder.clusterOf = clusterOf
 	return blder
 }
@@ -251,26 +263,44 @@ func (blder *MulticlusterBuilder) buildWildcard(
 		return nil, err
 	}
 
+	if len(blder.wildcardWatches) == 0 {
+		return nil, pkgerrors.New("there are no watches configured, controller will never get triggered. Use For(), Owns() or Watches() to set them up")
+	}
+
+	// Resolved now rather than inside the closure: the handler for Owns depends
+	// on the For type and the scheme, both of which are settled here, and a
+	// closure that re-derived them per cache could disagree with itself.
+	watches := make([]wildcardWatch, 0, len(blder.wildcardWatches))
 	for _, w := range blder.wildcardWatches {
-		h := w.handler
 		if w.owner {
 			if blder.forObject == nil {
 				return nil, pkgerrors.New("Owns() can only be used together with For()")
 			}
-			h = handler.EnqueueRequestForOwner(localMgr.GetScheme(), localMgr.GetRESTMapper(), blder.forObject)
+			w.handler = handler.EnqueueRequestForOwner(localMgr.GetScheme(), localMgr.GetRESTMapper(), blder.forObject)
 		}
-		preds := w.predicates
 		if blder.globalPredicate != nil {
 			// Prepended, so a global filter cannot be overridden by a
 			// watch-specific one that happens to come first.
-			preds = append([]predicate.Predicate{blder.globalPredicate}, preds...)
+			w.predicates = append([]predicate.Predicate{blder.globalPredicate}, w.predicates...)
 		}
-		if err := c.Watch(capimulticluster.WildcardSource(blder.wildcard, w.object, h, blder.clusterOf, preds...)); err != nil {
-			return nil, pkgerrors.Wrapf(err, "registering a fleet-wide watch on %T", w.object)
-		}
+		watches = append(watches, w)
 	}
-	if len(blder.wildcardWatches) == 0 {
-		return nil, pkgerrors.New("there are no watches configured, controller will never get triggered. Use For(), Owns() or Watches() to set them up")
+
+	// Registered through the registry rather than against a cache, because at
+	// this point there is no cache: the provider builds one per endpoint when it
+	// first sees one, and that is after every controller has been wired. The
+	// registry replays these onto each cache as it appears, so a fleet spanning
+	// shards gets every watch on every shard.
+	clusterOf := blder.clusterOf
+	if err := blder.registry.add(controllerName, func(wildcard crcache.Cache) error {
+		for _, w := range watches {
+			if err := c.Watch(capimulticluster.WildcardSource(wildcard, w.object, w.handler, clusterOf, w.predicates...)); err != nil {
+				return pkgerrors.Wrapf(err, "registering a fleet-wide watch on %T", w.object)
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 
 	return c, nil
@@ -304,9 +334,9 @@ func (r *loggingClusterNotFoundWrapper) Reconcile(ctx context.Context, req mcrec
 // function, which builds the builder itself and so cannot be handed one.
 type MulticlusterOption func(*MulticlusterBuilder)
 
-// WithWildcard is WithWildcardCache as a setup-function option.
-func WithWildcard(c crcache.Cache, clusterOf capimulticluster.ClusterResolver) MulticlusterOption {
-	return func(b *MulticlusterBuilder) { b.WithWildcardCache(c, clusterOf) }
+// WithWildcard is WithWildcardRegistry as a setup-function option.
+func WithWildcard(r *WildcardRegistry, clusterOf capimulticluster.ClusterResolver) MulticlusterOption {
+	return func(b *MulticlusterBuilder) { b.WithWildcardRegistry(r, clusterOf) }
 }
 
 // Apply applies options to the builder. Setup functions call it so that every
@@ -331,7 +361,7 @@ func NewMulticlusterControllerManagedBy(m mcmanager.Manager, predicateLog logr.L
 // For defines the type of Object being reconciled.
 func (blder *MulticlusterBuilder) For(object client.Object, opts ...mcbuilder.ForOption) *MulticlusterBuilder {
 	blder.forObject = object
-	if blder.wildcard != nil {
+	if blder.registry != nil {
 		blder.wildcardWatches = append(blder.wildcardWatches, wildcardWatch{
 			object:  object,
 			handler: &handler.EnqueueRequestForObject{},
@@ -346,7 +376,7 @@ func (blder *MulticlusterBuilder) For(object client.Object, opts ...mcbuilder.Fo
 func (blder *MulticlusterBuilder) Owns(object client.Object, predicates ...predicate.Predicate) *MulticlusterBuilder {
 	// Note: Prepend a ResourceIsChanged predicate to all "secondary" watches, matching Builder.
 	predicates = append([]predicate.Predicate{predicatesutil.ResourceIsChanged(blder.mgr.GetLocalManager().GetScheme(), blder.predicateLog)}, predicates...)
-	if blder.wildcard != nil {
+	if blder.registry != nil {
 		blder.wildcardWatches = append(blder.wildcardWatches, wildcardWatch{
 			object:     object,
 			predicates: predicates,
@@ -372,7 +402,7 @@ func (blder *MulticlusterBuilder) Owns(object client.Object, predicates ...predi
 // and the lift supplies the cluster around both.
 func (blder *MulticlusterBuilder) Watches(object client.Object, eventHandler handler.TypedEventHandler[client.Object, reconcile.Request], predicates ...predicate.Predicate) *MulticlusterBuilder {
 	predicates = append([]predicate.Predicate{predicatesutil.ResourceIsChanged(blder.mgr.GetLocalManager().GetScheme(), blder.predicateLog)}, predicates...)
-	if blder.wildcard != nil {
+	if blder.registry != nil {
 		blder.wildcardWatches = append(blder.wildcardWatches, wildcardWatch{
 			object:     object,
 			handler:    eventHandler,
@@ -530,7 +560,7 @@ func (blder *MulticlusterBuilder) Build(ctx context.Context, r reconcile.Reconci
 		mcc mccontroller.TypedController[mcreconcile.Request]
 		err error
 	)
-	if blder.wildcard != nil {
+	if blder.registry != nil {
 		c, err = blder.buildWildcard(controllerName, reconciler, localMgr)
 	} else {
 		mcc, err = blder.builder.Build(reconciler)
@@ -542,8 +572,9 @@ func (blder *MulticlusterBuilder) Build(ctx context.Context, r reconcile.Reconci
 
 	mc := &multiclusterController{
 		mc:        mcc,
-		wildcard:  blder.wildcard,
+		registry:  blder.registry,
 		clusterOf: blder.clusterOf,
+		name:      controllerName,
 		controllerWrapper: &controllerWrapper[mcreconcile.Request]{
 			TypedController:  c,
 			reconcileCache:   reconcileCache,

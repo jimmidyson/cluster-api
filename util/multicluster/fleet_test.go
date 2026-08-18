@@ -332,13 +332,18 @@ func TestWildcardSourceDropsUnresolvableClusters(t *testing.T) {
 		return mcmulticluster.ClusterName(o.GetNamespace()), o.GetNamespace() != ""
 	}
 
+	registry := &capicontrollerutil.WildcardRegistry{}
 	_, err = capicontrollerutil.NewMulticlusterControllerManagedBy(mgr, ctrl.Log.WithName("wildcard-drop")).
-		WithWildcardCache(mgr.GetLocalManager().GetCache(), clusterOf).
+		WithWildcardRegistry(registry, clusterOf).
 		For(&corev1.ConfigMap{}).
 		Named("wildcard-drop").
 		WithOptions(controller.TypedOptions[mcreconcile.Request]{MaxConcurrentReconciles: 2}).
 		Build(ctx, r)
 	g.Expect(err).ToNot(HaveOccurred())
+
+	// The cache arrives after the controller was built, which is the ordering a
+	// real provider imposes and the reason the registry exists.
+	g.Expect(registry.AddCache("local", mgr.GetLocalManager().GetCache())).To(Succeed())
 
 	go func() { _ = hostCluster.Start(ctx) }()
 	go func() { _ = mgr.Start(ctx) }()
