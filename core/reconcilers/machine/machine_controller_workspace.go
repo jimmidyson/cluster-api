@@ -94,7 +94,8 @@ func (r *Reconciler) SetupWithMulticlusterManager(
 		r.nodeDeletionRetryTimeout = 10 * time.Second
 	}
 
-	c, err := capicontrollerutil.NewMulticlusterControllerManagedBy(mgr, *r.predicateLog).
+	b := capicontrollerutil.NewMulticlusterControllerManagedBy(mgr, *r.predicateLog)
+	c, err := b.
 		Apply(opts...).
 		For(&clusterv1.Machine{}).
 		WithOptions(options).
@@ -145,7 +146,7 @@ func (r *Reconciler) SetupWithMulticlusterManager(
 		}), nil
 	}
 
-	r.recorder = localMgr.GetEventRecorderFor("machine-controller")
+	r.recorder = b.EventRecorderFor("machine-controller")
 	r.externalTracker = external.ObjectTracker{
 		MultiClusterController: c,
 		Scheme:                 localMgr.GetScheme(),

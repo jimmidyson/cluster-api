@@ -58,13 +58,14 @@ import (
 //
 // # What it does not solve
 //
-// The event recorder is the local manager's, so events this controller records
-// land in the management cluster rather than in the cluster the object came
-// from. record.EventRecorder takes no context, so this cannot be fixed the way
-// the clients are; a recorder that routes on the object instead would have to
-// come from the caller. Nothing in the reconcile path depends on where the event
-// lands, so this is a fidelity gap rather than a correctness one, and it is
-// stated rather than hidden.
+// Nothing, now that the event recorder is the caller's. It used to be the local
+// manager's, which for this project pointed at an endpoint that serves no core
+// v1.Event, so every event was rejected. record.EventRecorder takes no context,
+// so it could not be fixed the way the clients were — the recorder marks each
+// event with the cluster of the object instead, and the caller supplies a sink
+// that routes on the mark. See capimulticluster.NewClusterAwareRecorder and
+// MulticlusterBuilder.EventRecorderFor; a caller that supplies neither still
+// gets the local manager's recorder and the behaviour this had before.
 func (r *Reconciler) SetupWithMulticlusterManager(
 	ctx context.Context,
 	mgr mcmanager.Manager,
@@ -112,7 +113,7 @@ func (r *Reconciler) SetupWithMulticlusterManager(
 		return pkgerrors.Wrap(err, "failed setting up with a multicluster manager")
 	}
 
-	r.recorder = localMgr.GetEventRecorderFor("cluster-controller")
+	r.recorder = b.EventRecorderFor("cluster-controller")
 	// No Cache: a fleet-wide watch resolves each cluster's cache when that
 	// cluster engages, so there is no one cache to bind the tracker to.
 	r.externalTracker = external.ObjectTracker{

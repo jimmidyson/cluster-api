@@ -27,6 +27,7 @@ import (
 	pkgerrors "github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
@@ -174,6 +175,10 @@ type MulticlusterBuilder struct {
 	clusterOf       capimulticluster.ClusterResolver
 	wildcardWatches []wildcardWatch
 	globalPredicate predicate.Predicate
+
+	// recorderFor, when set, supplies each controller's event recorder instead
+	// of the local manager. See EventRecorderFor.
+	recorderFor func(name string) record.EventRecorder
 }
 
 // wildcardWatch is a declared watch, held until Build so it can be registered
@@ -333,6 +338,29 @@ func (r *loggingClusterNotFoundWrapper) Reconcile(ctx context.Context, req mcrec
 // MulticlusterOption configures a MulticlusterBuilder from a reconciler's setup
 // function, which builds the builder itself and so cannot be handed one.
 type MulticlusterOption func(*MulticlusterBuilder)
+
+// EventRecorderFor returns the recorder a controller should record with.
+//
+// The local manager's unless the caller supplied a factory, which is the
+// difference between events landing wherever the management client points and
+// events landing in the cluster the object came from. A fleet-wide controller
+// holds one recorder for many clusters, so routing it is the caller's business:
+// see capimulticluster.NewClusterAwareRecorder for the marking half.
+//
+// A method rather than something the builder applies, because the recorder is a
+// field on the reconciler and not on the controller — setup functions assign it
+// directly, and always did.
+func (blder *MulticlusterBuilder) EventRecorderFor(name string) record.EventRecorder {
+	if blder.recorderFor != nil {
+		return blder.recorderFor(name)
+	}
+	return blder.mgr.GetLocalManager().GetEventRecorderFor(name)
+}
+
+// WithEventRecorderFactory supplies the recorder each controller records with.
+func WithEventRecorderFactory(recorderFor func(name string) record.EventRecorder) MulticlusterOption {
+	return func(b *MulticlusterBuilder) { b.recorderFor = recorderFor }
+}
 
 // WithWildcard is WithWildcardRegistry as a setup-function option.
 func WithWildcard(r *WildcardRegistry, clusterOf capimulticluster.ClusterResolver) MulticlusterOption {
