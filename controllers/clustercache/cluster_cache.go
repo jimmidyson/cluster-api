@@ -18,6 +18,7 @@ package clustercache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -469,6 +470,27 @@ func (cc *clusterCache) Reconcile(ctx context.Context, req reconcile.Request) (r
 	if err := cc.client.Get(ctx, req.NamespacedName, cluster); err != nil {
 		if apierrors.IsNotFound(err) {
 			log.Info("Cluster has been deleted, disconnecting")
+			cc.cleanupForCluster(ctx, key)
+			return ctrl.Result{}, nil
+		}
+
+		// The whole logical cluster is gone, not just this Cluster. Same
+		// response, and it has to be spelled separately because the reason it
+		// arrives is different: no API server said "not found", the fleet no
+		// longer has an API server to ask.
+		//
+		// Requeueing instead — which is what the branch below would do — leaves
+		// a workspace that unbound still costing a reconcile every ten seconds,
+		// for every Cluster it held, forever. That is the fault this catches,
+		// and it is invisible to any measurement that does not unbind.
+		//
+		// Disconnecting is right even when the absence is transient: a
+		// connection to a workload cluster whose management workspace is not
+		// being served has nothing keeping it correct. If the workspace returns,
+		// the provider engages it again and the accessor is rebuilt from the
+		// events that follow.
+		if errors.Is(err, multicluster.ErrClusterNotFound) {
+			log.Info("Cluster's logical cluster is no longer served, disconnecting")
 			cc.cleanupForCluster(ctx, key)
 			return ctrl.Result{}, nil
 		}
