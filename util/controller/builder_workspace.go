@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog/v2"
+	ctrl "sigs.k8s.io/controller-runtime"
 	crcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
@@ -40,6 +42,7 @@ import (
 	mccontext "sigs.k8s.io/multicluster-runtime/pkg/context"
 	mccontroller "sigs.k8s.io/multicluster-runtime/pkg/controller"
 	mcmanager "sigs.k8s.io/multicluster-runtime/pkg/manager"
+	mcmulticluster "sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 	mcreconcile "sigs.k8s.io/multicluster-runtime/pkg/reconcile"
 	mcsource "sigs.k8s.io/multicluster-runtime/pkg/source"
 
@@ -241,7 +244,7 @@ func (blder *MulticlusterBuilder) buildWildcard(
 	localMgr manager.Manager,
 ) (controller.TypedController[mcreconcile.Request], error) {
 	options := blder.options
-	options.Reconciler = mcreconcile.NewClusterNotFoundWrapper(reconciler)
+	options.Reconciler = &loggingClusterNotFoundWrapper{inner: reconciler}
 
 	c, err := controller.NewTyped(controllerName, localMgr, options)
 	if err != nil {
@@ -271,6 +274,30 @@ func (blder *MulticlusterBuilder) buildWildcard(
 	}
 
 	return c, nil
+}
+
+// loggingClusterNotFoundWrapper says when work was dropped because the cluster
+// it named was not there.
+//
+// multicluster-runtime's wrapper turns ErrClusterNotFound into a successful
+// reconcile with no requeue, which is right — a wildcard source sees objects
+// from clusters the provider has not engaged, and retrying those forever would
+// be worse. But it is also the one place in this wiring where work disappears
+// without a trace, and the symptom of it happening to a cluster that *is*
+// engaged is a reconciler that simply never runs again. That is not something
+// to leave silent.
+type loggingClusterNotFoundWrapper struct {
+	inner reconcile.TypedReconciler[mcreconcile.Request]
+}
+
+func (r *loggingClusterNotFoundWrapper) Reconcile(ctx context.Context, req mcreconcile.Request) (reconcile.Result, error) {
+	res, err := r.inner.Reconcile(ctx, req)
+	if errors.Is(err, mcmulticluster.ErrClusterNotFound) {
+		ctrl.LoggerFrom(ctx).V(2).Info("Dropping reconcile: the request names a cluster the provider does not have",
+			"cluster", req.ClusterName, "object", req.String(), "error", err.Error())
+		return reconcile.Result{}, nil
+	}
+	return res, err
 }
 
 // MulticlusterOption configures a MulticlusterBuilder from a reconciler's setup

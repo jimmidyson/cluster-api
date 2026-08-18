@@ -18,9 +18,12 @@ package multicluster
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"k8s.io/client-go/util/workqueue"
+	"k8s.io/klog/v2"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
@@ -146,7 +149,23 @@ func (d *demultiplexingHandler) route(ctx context.Context, obj client.Object, q 
 	}
 	cluster, ok := d.clusterOf(obj)
 	if !ok {
+		// Logged, because this is a dropped event and a dropped event is
+		// indistinguishable from a controller that decided to do nothing. If
+		// the resolver is wrong about a type, the symptom is a reconciler that
+		// never runs, and nothing else says so.
+		ctrl.LoggerFrom(ctx).V(2).Info("Dropping event: its object names no cluster",
+			"object", klog.KObj(obj), "type", fmt.Sprintf("%T", obj))
 		return ctx, nil, false
+	}
+	// The resource version is the useful part. A reconcile woken by this event
+	// reads through whatever client its reconciler holds, and if that client's
+	// cache is a different informer from this one it can answer with a version
+	// older than the event that caused the wake — which looks exactly like a
+	// reconciler that decided to do nothing. Logging what was routed makes that
+	// comparison possible against the reconcile that follows.
+	if log := ctrl.LoggerFrom(ctx); log.V(4).Enabled() {
+		log.V(4).Info("Routing event", "cluster", cluster, "object", klog.KObj(obj),
+			"type", fmt.Sprintf("%T", obj), "resourceVersion", obj.GetResourceVersion())
 	}
 	return mccontext.WithCluster(ctx, cluster), &clusterStampingQueue{q: q, cluster: cluster}, true
 }
