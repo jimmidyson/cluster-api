@@ -41,6 +41,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
@@ -367,4 +368,106 @@ func TestWildcardSourceDropsUnresolvableClusters(t *testing.T) {
 	settled := r.count(unresolvable)
 	g.Consistently(func() int { return r.count(unresolvable) }, 5*time.Second, 250*time.Millisecond).
 		Should(BeNumerically("<=", settled), "an unresolvable cluster is being retried rather than dropped")
+}
+
+// recordingRawSource is a raw source that says whether it was ever started, and
+// enqueues one request when it is.
+//
+// It stands in for clustercache's Cluster-event source, which is the only raw
+// source the fleet-wide wiring uses. What matters about that one is not what it
+// carries but that something reads its channel: its sender blocks on a
+// consumer that only exists once Start has run.
+type recordingRawSource struct {
+	request mcreconcile.Request
+
+	mu      sync.Mutex
+	started bool
+}
+
+func (s *recordingRawSource) Start(_ context.Context, q workqueue.TypedRateLimitingInterface[mcreconcile.Request]) error {
+	s.mu.Lock()
+	s.started = true
+	s.mu.Unlock()
+	q.Add(s.request)
+	return nil
+}
+
+func (s *recordingRawSource) wasStarted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.started
+}
+
+// TestWildcardControllerStartsRawSources covers a source that is declared and
+// then never read.
+//
+// In wildcard mode the multicluster builder is not the thing that builds the
+// controller, so a source handed to it goes nowhere: it is never started, and
+// nothing ever reads what it is sent. The symptom is not an error anywhere.
+// It is the ClusterCache's sends to that source blocking until they time out,
+// and a control plane provider that asked to hear about a failed connection
+// probe never hearing about one.
+//
+// The assertion is the whole chain: the source is started, and what it enqueues
+// reaches the reconciler with its cluster intact.
+func TestWildcardControllerStartsRawSources(t *testing.T) {
+	g := NewWithT(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	raw, err := client.New(restConfig, client.Options{Scheme: scheme.Scheme})
+	g.Expect(err).ToNot(HaveOccurred())
+
+	const ns = "wildcard-raw-source"
+	g.Expect(client.IgnoreAlreadyExists(raw.Create(ctx, &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: ns},
+	}))).To(Succeed())
+
+	hostCluster, err := cluster.New(restConfig, func(o *cluster.Options) { o.Scheme = scheme.Scheme })
+	g.Expect(err).ToNot(HaveOccurred())
+	provider := namespaceprovider.New(hostCluster)
+
+	mgr, err := mcmanager.New(restConfig, provider, manager.Options{
+		Scheme:         scheme.Scheme,
+		Metrics:        server.Options{BindAddress: "0"},
+		LeaderElection: false,
+	})
+	g.Expect(err).ToNot(HaveOccurred())
+
+	r := &countingReconciler{
+		client: capimulticluster.NewClusterAwareClient(mgr),
+		counts: map[string]int{},
+	}
+
+	// The namespace provider presents a namespace as a cluster whose only
+	// namespace is "default", so a request it can resolve is one naming the
+	// namespace as the cluster.
+	src := &recordingRawSource{request: mcreconcile.Request{
+		Request:     reconcile.Request{NamespacedName: types.NamespacedName{Namespace: metav1.NamespaceDefault, Name: "from-the-raw-source"}},
+		ClusterName: ns,
+	}}
+
+	clusterOf := func(o client.Object) (mcmulticluster.ClusterName, bool) {
+		return mcmulticluster.ClusterName(o.GetNamespace()), o.GetNamespace() != ""
+	}
+
+	registry := &capicontrollerutil.WildcardRegistry{}
+	_, err = capicontrollerutil.NewMulticlusterControllerManagedBy(mgr, ctrl.Log.WithName("wildcard-raw-source")).
+		WithWildcardRegistry(registry, clusterOf).
+		For(&corev1.ConfigMap{}).
+		Named("wildcard-raw-source").
+		WatchesRawSource(src).
+		WithOptions(controller.TypedOptions[mcreconcile.Request]{MaxConcurrentReconciles: 2}).
+		Build(ctx, r)
+	g.Expect(err).ToNot(HaveOccurred())
+
+	g.Expect(registry.AddCache("local", mgr.GetLocalManager().GetCache())).To(Succeed())
+
+	go func() { _ = hostCluster.Start(ctx) }()
+	go func() { _ = mgr.Start(ctx) }()
+
+	g.Eventually(src.wasStarted, 30*time.Second, 100*time.Millisecond).
+		Should(BeTrue(), "the raw source was declared but never started, so nothing reads what is sent to it")
+	g.Eventually(func() int { return r.count("from-the-raw-source") }, 30*time.Second, 100*time.Millisecond).
+		Should(BeNumerically(">=", 1), "the raw source started but what it enqueued never reached the reconciler")
 }

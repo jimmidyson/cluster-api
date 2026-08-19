@@ -176,6 +176,12 @@ type MulticlusterBuilder struct {
 	wildcardWatches []wildcardWatch
 	globalPredicate predicate.Predicate
 
+	// rawSources holds the sources given to WatchesRawSource in wildcard mode,
+	// until Build has a controller to register them against. See
+	// WatchesRawSource for why they cannot be left with the multicluster
+	// builder.
+	rawSources []source.TypedSource[mcreconcile.Request]
+
 	// recorderFor, when set, supplies each controller's event recorder instead
 	// of the local manager. See EventRecorderFor.
 	recorderFor func(name string) record.EventRecorder
@@ -268,8 +274,17 @@ func (blder *MulticlusterBuilder) buildWildcard(
 		return nil, err
 	}
 
-	if len(blder.wildcardWatches) == 0 {
+	if len(blder.wildcardWatches) == 0 && len(blder.rawSources) == 0 {
 		return nil, pkgerrors.New("there are no watches configured, controller will never get triggered. Use For(), Owns() or Watches() to set them up")
+	}
+
+	// Straight onto the controller, not through the registry: a raw source
+	// carries its own cluster and has no cache to be replayed onto, so it is
+	// registered once here and started when the controller starts.
+	for _, src := range blder.rawSources {
+		if err := c.Watch(src); err != nil {
+			return nil, pkgerrors.Wrapf(err, "registering a raw source of type %T", src)
+		}
 	}
 
 	// Resolved now rather than inside the closure: the handler for Owns depends
@@ -449,7 +464,18 @@ func (blder *MulticlusterBuilder) Watches(object client.Object, eventHandler han
 // the cluster on what it enqueues. See
 // clustercache.MulticlusterClusterSourceFunc for the one the core reconcilers
 // need.
+//
+// In wildcard mode it is held until Build rather than handed to the
+// multicluster builder, because in that mode the multicluster builder is never
+// built — buildWildcard constructs the controller directly. A source left with
+// it is therefore never started, and a source that is never started is one
+// nobody reads: the ClusterCache's sends to it block until they time out, and
+// no probe failure ever reaches the controller that asked to hear about it.
 func (blder *MulticlusterBuilder) WatchesRawSource(src source.TypedSource[mcreconcile.Request]) *MulticlusterBuilder {
+	if blder.registry != nil {
+		blder.rawSources = append(blder.rawSources, src)
+		return blder
+	}
 	blder.builder.WatchesRawSource(src)
 	return blder
 }
