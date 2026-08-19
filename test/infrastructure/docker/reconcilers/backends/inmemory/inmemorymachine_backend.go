@@ -33,7 +33,6 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -201,7 +200,7 @@ func (r *MachineBackendReconciler) reconcileNormalCloudMachine(ctx context.Conte
 	}()
 
 	// Compute the name for resource group.
-	resourceGroup := klog.KObj(cluster).String()
+	resourceGroup := workloadClusterKey(ctx, cluster)
 	inmemoryClient := r.InMemoryManager.GetResourceGroup(resourceGroup).GetClient()
 
 	// Create VM; a Cloud VM can be created as soon as the Infra Machine is created
@@ -316,7 +315,7 @@ func (r *MachineBackendReconciler) reconcileNormalNode(ctx context.Context, clus
 	}
 
 	// Compute the name for resource group.
-	resourceGroup := klog.KObj(cluster).String()
+	resourceGroup := workloadClusterKey(ctx, cluster)
 	inmemoryClient := r.InMemoryManager.GetResourceGroup(resourceGroup).GetClient()
 
 	// Create Node
@@ -466,8 +465,8 @@ func (r *MachineBackendReconciler) reconcileNormalETCD(ctx context.Context, clus
 
 	// Compute the resource group and listener unique name.
 	// NOTE: we are using the same name for convenience, but it is not required.
-	resourceGroup := klog.KObj(cluster).String()
-	listenerName := klog.KObj(cluster).String()
+	resourceGroup := workloadClusterKey(ctx, cluster)
+	listenerName := workloadClusterKey(ctx, cluster)
 	inmemoryClient := r.InMemoryManager.GetResourceGroup(resourceGroup).GetClient()
 
 	// Create the etcd pod
@@ -707,8 +706,8 @@ func (r *MachineBackendReconciler) reconcileNormalAPIServer(ctx context.Context,
 
 	// Compute the resource group and listener unique name.
 	// NOTE: we are using the same name for convenience, but it is not required.
-	resourceGroup := klog.KObj(cluster).String()
-	listenerName := klog.KObj(cluster).String()
+	resourceGroup := workloadClusterKey(ctx, cluster)
+	listenerName := workloadClusterKey(ctx, cluster)
 	inmemoryClient := r.InMemoryManager.GetResourceGroup(resourceGroup).GetClient()
 
 	// Create the apiserver pod
@@ -805,7 +804,7 @@ func (r *MachineBackendReconciler) reconcileNormalScheduler(ctx context.Context,
 	}
 
 	// Compute the resource group unique name.
-	resourceGroup := klog.KObj(cluster).String()
+	resourceGroup := workloadClusterKey(ctx, cluster)
 	inmemoryClient := r.InMemoryManager.GetResourceGroup(resourceGroup).GetClient()
 
 	schedulerPod := &corev1.Pod{
@@ -852,7 +851,7 @@ func (r *MachineBackendReconciler) reconcileNormalControllerManager(ctx context.
 	}
 
 	// Compute the resource group unique name.
-	resourceGroup := klog.KObj(cluster).String()
+	resourceGroup := workloadClusterKey(ctx, cluster)
 	inmemoryClient := r.InMemoryManager.GetResourceGroup(resourceGroup).GetClient()
 
 	controllerManagerPod := &corev1.Pod{
@@ -891,7 +890,7 @@ func (r *MachineBackendReconciler) reconcileNormalKubeadmObjects(ctx context.Con
 	}
 
 	// Compute the resource group unique name.
-	resourceGroup := klog.KObj(cluster).String()
+	resourceGroup := workloadClusterKey(ctx, cluster)
 	inmemoryClient := r.InMemoryManager.GetResourceGroup(resourceGroup).GetClient()
 
 	// create kubeadm ClusterRole and ClusterRoleBinding enforced by KCP
@@ -960,7 +959,7 @@ func (r *MachineBackendReconciler) reconcileNormalKubeProxy(ctx context.Context,
 	// TODO: Add provisioning time for KubeProxy.
 
 	// Compute the resource group unique name.
-	resourceGroup := klog.KObj(cluster).String()
+	resourceGroup := workloadClusterKey(ctx, cluster)
 	inmemoryClient := r.InMemoryManager.GetResourceGroup(resourceGroup).GetClient()
 
 	// Create the kube-proxy-daemonset
@@ -1006,7 +1005,7 @@ func (r *MachineBackendReconciler) reconcileNormalCoredns(ctx context.Context, c
 	// TODO: Add provisioning time for CoreDNS.
 
 	// Compute the resource group unique name.
-	resourceGroup := klog.KObj(cluster).String()
+	resourceGroup := workloadClusterKey(ctx, cluster)
 	inmemoryClient := r.InMemoryManager.GetResourceGroup(resourceGroup).GetClient()
 
 	// Create the coredns configMap.
@@ -1101,7 +1100,7 @@ func (r *MachineBackendReconciler) ReconcileDelete(ctx context.Context, cluster 
 
 func (r *MachineBackendReconciler) reconcileDeleteCloudMachine(ctx context.Context, cluster *clusterv1.Cluster, _ *clusterv1.Machine, inMemoryMachine *infrav1.DevMachine) (ctrl.Result, error) {
 	// Compute the resource group unique name.
-	resourceGroup := klog.KObj(cluster).String()
+	resourceGroup := workloadClusterKey(ctx, cluster)
 	inmemoryClient := r.InMemoryManager.GetResourceGroup(resourceGroup).GetClient()
 
 	// Delete VM
@@ -1119,7 +1118,7 @@ func (r *MachineBackendReconciler) reconcileDeleteCloudMachine(ctx context.Conte
 
 func (r *MachineBackendReconciler) reconcileDeleteNode(ctx context.Context, cluster *clusterv1.Cluster, _ *clusterv1.Machine, inMemoryMachine *infrav1.DevMachine) (ctrl.Result, error) {
 	// Compute the resource group unique name.
-	resourceGroup := klog.KObj(cluster).String()
+	resourceGroup := workloadClusterKey(ctx, cluster)
 	inmemoryClient := r.InMemoryManager.GetResourceGroup(resourceGroup).GetClient()
 
 	// Delete Node
@@ -1145,8 +1144,8 @@ func (r *MachineBackendReconciler) reconcileDeleteETCD(ctx context.Context, clus
 
 	// Compute the resource group and listener unique name.
 	// NOTE: we are using the same name for convenience, but it is not required.
-	resourceGroup := klog.KObj(cluster).String()
-	listenerName := klog.KObj(cluster).String()
+	resourceGroup := workloadClusterKey(ctx, cluster)
+	listenerName := workloadClusterKey(ctx, cluster)
 	inmemoryClient := r.InMemoryManager.GetResourceGroup(resourceGroup).GetClient()
 
 	etcdMember := fmt.Sprintf("etcd-%s", inMemoryMachine.Name)
@@ -1179,8 +1178,8 @@ func (r *MachineBackendReconciler) reconcileDeleteAPIServer(ctx context.Context,
 
 	// Compute the resource group and listener unique name.
 	// NOTE: we are using the same name for convenience, but it is not required.
-	resourceGroup := klog.KObj(cluster).String()
-	listenerName := klog.KObj(cluster).String()
+	resourceGroup := workloadClusterKey(ctx, cluster)
+	listenerName := workloadClusterKey(ctx, cluster)
 	inmemoryClient := r.InMemoryManager.GetResourceGroup(resourceGroup).GetClient()
 
 	apiServer := fmt.Sprintf("kube-apiserver-%s", inMemoryMachine.Name)
@@ -1207,7 +1206,7 @@ func (r *MachineBackendReconciler) reconcileDeleteScheduler(ctx context.Context,
 	}
 
 	// Compute the resource group unique name.
-	resourceGroup := klog.KObj(cluster).String()
+	resourceGroup := workloadClusterKey(ctx, cluster)
 	inmemoryClient := r.InMemoryManager.GetResourceGroup(resourceGroup).GetClient()
 
 	schedulerPod := &corev1.Pod{
@@ -1230,7 +1229,7 @@ func (r *MachineBackendReconciler) reconcileDeleteControllerManager(ctx context.
 	}
 
 	// Compute the resource group unique name.
-	resourceGroup := klog.KObj(cluster).String()
+	resourceGroup := workloadClusterKey(ctx, cluster)
 	inmemoryClient := r.InMemoryManager.GetResourceGroup(resourceGroup).GetClient()
 
 	controllerManagerPod := &corev1.Pod{

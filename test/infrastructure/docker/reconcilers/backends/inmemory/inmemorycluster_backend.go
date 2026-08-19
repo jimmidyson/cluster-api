@@ -29,7 +29,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/klog/v2"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -60,8 +59,8 @@ func (r *ClusterBackendReconciler) ReconcileNormal(ctx context.Context, cluster 
 
 	// Compute the name for resource group and listener.
 	// NOTE: we are using the same name for convenience, but it is not required.
-	resourceGroup := klog.KObj(cluster).String()
-	listenerName := klog.KObj(cluster).String()
+	resourceGroup := workloadClusterKey(ctx, cluster)
+	listenerName := workloadClusterKey(ctx, cluster)
 
 	// Store the resource group used by this inMemoryCluster.
 	inMemoryCluster.Annotations[infrav1.ListenerAnnotationName] = listenerName
@@ -164,15 +163,15 @@ func (r *ClusterBackendReconciler) ReconcileNormal(ctx context.Context, cluster 
 }
 
 // ReconcileDelete handle in memory backend for deleted DevCluster.
-func (r *ClusterBackendReconciler) ReconcileDelete(_ context.Context, cluster *clusterv1.Cluster, inMemoryCluster *infrav1.DevCluster) (ctrl.Result, error) {
+func (r *ClusterBackendReconciler) ReconcileDelete(ctx context.Context, cluster *clusterv1.Cluster, inMemoryCluster *infrav1.DevCluster) (ctrl.Result, error) {
 	if inMemoryCluster.Spec.Backend.InMemory == nil {
 		return ctrl.Result{}, pkgerrors.New("InMemoryBackendReconciler can't be called for DevClusters without an InMemory backend")
 	}
 
 	// Compute the name for resource group and listener.
 	// NOTE: we are using the same name for convenience, but it is not required.
-	resourceGroup := klog.KObj(cluster).String()
-	listenerName := klog.KObj(cluster).String()
+	resourceGroup := workloadClusterKey(ctx, cluster)
+	listenerName := workloadClusterKey(ctx, cluster)
 
 	// Delete the resource group hosting all the in memory resources belonging the workload cluster;
 	r.InMemoryManager.DeleteResourceGroup(resourceGroup)
