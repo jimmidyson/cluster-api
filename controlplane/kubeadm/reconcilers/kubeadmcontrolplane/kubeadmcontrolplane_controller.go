@@ -32,6 +32,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/tools/record"
@@ -97,7 +98,7 @@ type Reconciler struct {
 	SecretCachingClient             client.Client
 	machineClientWithDeleteResponse capicontrollerutil.ClientWithDeleteResponse
 	RuntimeClient                   runtimeclient.Client
-	controller                      capicontrollerutil.Controller
+	controller                      kubeadmControlPlaneController
 	recorder                        record.EventRecorder
 	ClusterCache                    clustercache.ClusterCache
 
@@ -124,6 +125,22 @@ type Reconciler struct {
 	// Note: This field is only used for unit tests that use fake client because the fake client does not properly set resourceVersion
 	//       on BootstrapConfig/InfraMachine after ssa.Patch and then ssa.RemoveManagedFieldsForLabelsAndAnnotations would fail.
 	disableRemoveManagedFieldsForLabelsAndAnnotations bool
+}
+
+// kubeadmControlPlaneController is the part of the built controller the
+// reconcile path uses.
+//
+// Narrowed from capicontrollerutil.Controller so that the same field can hold
+// either the single-cluster controller or the fleet-wide one. Those differ in
+// their request type - reconcile.Request against mcreconcile.Request - and so
+// have no common interface beyond the methods that do not mention it. These
+// three are the ones the reconcile path calls, and none of them mentions a
+// request type: they are called from inside Reconcile, where the cluster is
+// already established.
+type kubeadmControlPlaneController interface {
+	DeferNextReconcileForObject(obj metav1.Object, reconcileAfter time.Time)
+	DeferNextReconcileUntilCacheUpToDate(reconciledObject metav1.Object, writtenObjectGVKT capicontrollerutil.GroupVersionKindType, writtenObjectResourceVersion string)
+	ClearConsistencyStore(reconciledObject client.ObjectKey, reconciledObjectUID types.UID)
 }
 
 // SetupWithManager sets up the reconciler with the Manager.
