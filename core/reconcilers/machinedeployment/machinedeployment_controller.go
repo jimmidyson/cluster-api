@@ -28,6 +28,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog/v2"
@@ -86,12 +87,24 @@ type Reconciler struct {
 	// WatchFilterValue is the label value used to filter events prior to reconciliation.
 	WatchFilterValue string
 
-	controller capicontrollerutil.Controller
+	controller machineDeploymentController
 	recorder   record.EventRecorder
 	ssaCache   ssa.Cache
 
 	canUpdateMachineSetCache   cache.Cache[CanUpdateMachineSetCacheEntry]
 	msClientWithDeleteResponse capicontrollerutil.ClientWithDeleteResponse
+}
+
+// machineDeploymentController is the part of the built controller the reconcile path uses.
+//
+// Narrowed from capicontrollerutil.Controller so that the same field can hold
+// either the single-cluster controller or the fleet-wide one, as the Machine
+// and KubeadmControlPlane reconcilers' equivalents are. Those differ in their
+// request type and so have no common interface beyond the methods that do not
+// mention it.
+type machineDeploymentController interface {
+	DeferNextReconcileUntilCacheUpToDate(reconciledObject metav1.Object, writtenObjectGVKT capicontrollerutil.GroupVersionKindType, writtenObjectResourceVersion string)
+	ClearConsistencyStore(reconciledObject client.ObjectKey, reconciledObjectUID types.UID)
 }
 
 // SetupWithManager sets up the reconciler with the Manager.

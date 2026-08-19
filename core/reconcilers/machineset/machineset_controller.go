@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -106,7 +107,7 @@ type Reconciler struct {
 	WatchFilterValue string
 
 	ssaCache   ssa.Cache
-	controller capicontrollerutil.Controller
+	controller machineSetController
 	recorder   record.EventRecorder
 
 	// Note: This field is only used for unit tests that use fake client because the fake client does not properly set resourceVersion
@@ -118,6 +119,18 @@ type Reconciler struct {
 	overrideCreateMachines                               func(ctx context.Context, s *scope, machinesToAdd int) (ctrl.Result, error)
 	overrideMoveMachines                                 func(ctx context.Context, s *scope, targetMSName string, machinesToMove int) (ctrl.Result, error)
 	overrideDeleteMachines                               func(ctx context.Context, s *scope, machinesToDelete int) (ctrl.Result, error)
+}
+
+// machineSetController is the part of the built controller the reconcile path uses.
+//
+// Narrowed from capicontrollerutil.Controller so that the same field can hold
+// either the single-cluster controller or the fleet-wide one, as the Machine
+// and KubeadmControlPlane reconcilers' equivalents are. Those differ in their
+// request type and so have no common interface beyond the methods that do not
+// mention it.
+type machineSetController interface {
+	DeferNextReconcileUntilCacheUpToDate(reconciledObject metav1.Object, writtenObjectGVKT capicontrollerutil.GroupVersionKindType, writtenObjectResourceVersion string)
+	ClearConsistencyStore(reconciledObject client.ObjectKey, reconciledObjectUID types.UID)
 }
 
 // SetupWithManager sets up the reconciler with the Manager.
