@@ -709,22 +709,77 @@ func (cc *clusterCache) GetClusterSource(controllerName string, mapFunc func(ctx
 	return source.Channel(ch, handler.TypedEnqueueRequestsFromMapFunc(mapFunc))
 }
 
+// clusterSourceSendTimeout bounds one send to one cluster source.
+//
+// A source's consumer is a goroutine that ends with the context it was started
+// with, and nothing tells the ClusterCache when that happens: clusterSources is
+// append-only, so a source whose consumer has gone is still in the list and
+// still sent to. Without a bound, that send waits for a receive that is never
+// coming.
+//
+// Dropping an event is recoverable and blocking is not. The reconcile that
+// would have sent it runs again - on the next probe, and at the latest on the
+// ten-second requeue - so a live-but-slow consumer gets the next one, and a
+// dead consumer costs a log line rather than the cache.
+const clusterSourceSendTimeout = 10 * time.Second
+
 func (cc *clusterCache) sendEventsToClusterSources(ctx context.Context, cluster *clusterv1.Cluster, now, lastProbeSuccessTime time.Time, didConnect, didDisconnect bool) {
 	log := ctrl.LoggerFrom(ctx)
 
-	cc.clusterSourcesLock.Lock()
-	defer cc.clusterSourcesLock.Unlock()
-
 	key := keyFor(ctx, client.ObjectKeyFromObject(cluster))
 
+	// What to send is decided under the lock; the sending happens outside it.
+	//
+	// Holding the lock across the send is a deadlock, and was one: the send
+	// blocks until the source's consumer takes the event, so a consumer that
+	// has stopped reading wedges every other caller of this lock - which is
+	// every connect, every disconnect and every GetClusterSource, for every
+	// cluster in the fleet. A goroutine profile across a workspace's departure
+	// found exactly that: one goroutine blocked in the send holding the lock,
+	// another waiting for it, and accessors that could no longer be
+	// disconnected because the reconcile that would do it never got that far.
+	type pending struct {
+		controllerName string
+		send           func(context.Context, multicluster.ClusterName, *clusterv1.Cluster)
+		lastEventSent  map[accessorKey]time.Time
+		reasons        []string
+	}
+
+	cc.clusterSourcesLock.Lock()
+	sends := make([]pending, 0, len(cc.clusterSources))
 	for _, cs := range cc.clusterSources {
 		lastEventSentTime := cs.lastEventSentTimeByCluster[key]
 
 		if reasons := shouldSendEvent(now, lastProbeSuccessTime, lastEventSentTime, didConnect, didDisconnect, cs.sendEventAfterProbeFailureDurations); len(reasons) > 0 {
-			log.V(6).Info("Sending Cluster event", "targetController", cs.controllerName, "reasons", strings.Join(reasons, ", "))
-			cs.send(ctx, key.workspace, cluster)
-			cs.lastEventSentTimeByCluster[key] = now
+			sends = append(sends, pending{
+				controllerName: cs.controllerName,
+				send:           cs.send,
+				lastEventSent:  cs.lastEventSentTimeByCluster,
+				reasons:        reasons,
+			})
 		}
+	}
+	cc.clusterSourcesLock.Unlock()
+
+	for _, p := range sends {
+		log.V(6).Info("Sending Cluster event", "targetController", p.controllerName, "reasons", strings.Join(p.reasons, ", "))
+
+		sendCtx, cancel := context.WithTimeout(ctx, clusterSourceSendTimeout)
+		p.send(sendCtx, key.workspace, cluster)
+		timedOut := sendCtx.Err() != nil && ctx.Err() == nil
+		cancel()
+
+		if timedOut {
+			// Not recorded as sent: the next reconcile should try again rather
+			// than treat a dropped event as delivered.
+			log.Info("Gave up sending a Cluster event: the source's consumer is not reading",
+				"targetController", p.controllerName, "timeout", clusterSourceSendTimeout)
+			continue
+		}
+
+		cc.clusterSourcesLock.Lock()
+		p.lastEventSent[key] = now
+		cc.clusterSourcesLock.Unlock()
 	}
 }
 
