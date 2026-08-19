@@ -146,6 +146,14 @@ func (r *DevMachine) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 	// Fetch the Machine.
 	machine, err := util.GetOwnerMachine(ctx, r.Client, devMachine.ObjectMeta)
 	if err != nil {
+		// An owner reference to a Machine that has already been deleted is not
+		// the same as no owner reference at all, and only the second is handled
+		// below: this lookup errors rather than returning nil, so a deleted
+		// DevMachine whose Machine went first would retry forever. See
+		// releaseDeletedDevMachine.
+		if !devMachine.DeletionTimestamp.IsZero() && apierrors.IsNotFound(err) {
+			return r.releaseDeletedDevMachine(ctx, devMachine, "its owner Machine")
+		}
 		return ctrl.Result{}, err
 	}
 	if machine == nil {
@@ -153,14 +161,7 @@ func (r *DevMachine) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 		// Note: This should not be necessary anymore as we nowadays only set the finalizer after the ownerRef
 		// is set, but keeping this as a safeguard.
 		if !devMachine.DeletionTimestamp.IsZero() {
-			if controllerutil.ContainsFinalizer(devMachine, infrav1.MachineFinalizer) {
-				devMachineWithoutFinalizer := devMachine.DeepCopy()
-				controllerutil.RemoveFinalizer(devMachineWithoutFinalizer, infrav1.MachineFinalizer)
-				if err := r.Client.Patch(ctx, devMachineWithoutFinalizer, client.MergeFrom(devMachine)); err != nil {
-					return ctrl.Result{}, pkgerrors.Wrapf(err, "failed to patch DevMachine %s", klog.KObj(devMachine))
-				}
-			}
-			return ctrl.Result{}, nil
+			return r.releaseDeletedDevMachine(ctx, devMachine, "an owner reference to a Machine")
 		}
 
 		log.Info("Waiting for Machine Controller to set OwnerRef on DevMachine")
@@ -173,6 +174,14 @@ func (r *DevMachine) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 	// Fetch the Cluster.
 	cluster, err := util.GetClusterFromMetadata(ctx, r.Client, machine.ObjectMeta)
 	if err != nil {
+		// A DevMachine being deleted whose Cluster has already gone has nothing
+		// left to reconcile against: the Cluster is what names the backend
+		// state this machine owns, and the DevCluster reconciler tears all of
+		// that down with the Cluster. Without this the finalizer is never
+		// removed - see releaseDeletedDevMachine.
+		if !devMachine.DeletionTimestamp.IsZero() && (apierrors.IsNotFound(err) || pkgerrors.Is(err, util.ErrNoCluster)) {
+			return r.releaseDeletedDevMachine(ctx, devMachine, "its Cluster")
+		}
 		log.Info("DevMachine owner Machine is missing cluster label or cluster does not exist")
 		return ctrl.Result{}, err
 	}
@@ -213,6 +222,12 @@ func (r *DevMachine) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 		Name:      cluster.Spec.InfrastructureRef.Name,
 	}
 	if err := r.Get(ctx, devClusterName, devCluster); err != nil {
+		// As above: a deleted DevMachine whose DevCluster has already gone has
+		// nothing left to clean up, and waiting for a DevCluster that is never
+		// coming back is waiting forever.
+		if !devMachine.DeletionTimestamp.IsZero() && apierrors.IsNotFound(err) {
+			return r.releaseDeletedDevMachine(ctx, devMachine, "its DevCluster")
+		}
 		log.Info("DevCluster is not available yet")
 		return ctrl.Result{}, nil
 	}
@@ -233,6 +248,48 @@ func (r *DevMachine) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 
 	// Handle non-deleted machines
 	return backendReconciler.ReconcileNormal(ctx, cluster, devCluster, machine, devMachine)
+}
+
+// releaseDeletedDevMachine drops the finalizer from a DevMachine that is being
+// deleted and whose backend state is already gone with the object named in
+// missing.
+//
+// Reconciling a DevMachine needs its Machine, its Cluster and its DevCluster,
+// and each of those is normally deleted *after* it. Normally: Cluster API's
+// teardown is a sequence, and something that removes the objects in a different
+// order - a kcp APIBinding being deleted takes every bound object at once -
+// leaves this reconcile with nothing to work from. Before this, two of those
+// three cases had no exit: the reconcile returned without requeueing, or
+// errored forever, and the finalizer stayed. The DevMachine then held the
+// Machine, which held the control plane, which held the Cluster, which held the
+// APIBinding - a workspace that can never finish unbinding.
+//
+// It is a last resort, not the normal path. Backend state does not all belong
+// to the cluster - the docker backend deletes only the load balancer with the
+// DevCluster and leaves each machine's container to this reconcile - so
+// releasing a DevMachine without running its backend delete can leak. The
+// DevCluster reconciler is what keeps that from happening: it waits for its
+// DevMachines before removing its own finalizer, so the ordinary case reaches
+// ReconcileDelete with everything it needs.
+//
+// What is left here is the case where that guarantee is already broken: the
+// Machine or the Cluster this DevMachine names has gone, and there is no way
+// to reach the backend state at all, because it is keyed by the cluster.
+// Holding the finalizer would not clean anything up either - it would only
+// stop everything that owns this object from finishing.
+func (r *DevMachine) releaseDeletedDevMachine(ctx context.Context, devMachine *infrav1.DevMachine, missing string) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(devMachine, infrav1.MachineFinalizer) {
+		return ctrl.Result{}, nil
+	}
+
+	ctrl.LoggerFrom(ctx).Info("Releasing a deleted DevMachine because "+missing+" is already gone", "DevMachine", klog.KObj(devMachine))
+
+	devMachineWithoutFinalizer := devMachine.DeepCopy()
+	controllerutil.RemoveFinalizer(devMachineWithoutFinalizer, infrav1.MachineFinalizer)
+	if err := r.Client.Patch(ctx, devMachineWithoutFinalizer, client.MergeFrom(devMachine)); err != nil {
+		return ctrl.Result{}, pkgerrors.Wrapf(err, "failed to patch DevMachine %s", klog.KObj(devMachine))
+	}
+	return ctrl.Result{}, nil
 }
 
 func (r *DevMachine) backendReconcilerFactory(_ context.Context, devMachine *infrav1.DevMachine) backends.DevMachineBackendReconciler {

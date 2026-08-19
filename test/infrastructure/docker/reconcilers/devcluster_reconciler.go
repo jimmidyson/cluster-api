@@ -19,6 +19,7 @@ package reconcilers
 
 import (
 	"context"
+	"time"
 
 	pkgerrors "github.com/pkg/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -157,11 +158,49 @@ func (r *DevCluster) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Re
 
 	// Handle deleted clusters
 	if !devCluster.DeletionTimestamp.IsZero() {
+		// A DevCluster outlives the DevMachines that belong to it, because they
+		// cannot clean themselves up without it: the docker backend deletes
+		// only the load balancer here and leaves each machine's container to
+		// that machine's own reconcile, and the in-memory backend names its
+		// per-cluster state after the Cluster. Deleted first, the machines have
+		// nothing to delete their containers with.
+		//
+		// Cluster API's own teardown never gets this wrong — it deletes
+		// Machines before the infrastructure cluster — but nothing here depends
+		// on it: deleting a kcp APIBinding removes every bound object at once,
+		// and a person can always delete a DevCluster by hand. Waiting makes the
+		// order a property of this controller rather than of its callers.
+		remaining, err := r.devMachinesFor(ctx, devCluster.Namespace, cluster.Name)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if remaining > 0 {
+			log.Info("Waiting for DevMachines to be deleted before deleting the DevCluster", "DevMachines", remaining)
+			return ctrl.Result{RequeueAfter: devMachineDeletionRequeue}, nil
+		}
 		return backendReconciler.ReconcileDelete(ctx, cluster, devCluster)
 	}
 
 	// Handle non-deleted clusters
 	return backendReconciler.ReconcileNormal(ctx, cluster, devCluster)
+}
+
+// devMachineDeletionRequeue is how often a deleting DevCluster re-checks
+// whether its machines have gone. The DevCluster controller does not watch
+// DevMachines - it has never needed to - so this is a poll rather than an
+// event, and it is short because it only runs while a cluster is being deleted.
+const devMachineDeletionRequeue = 5 * time.Second
+
+// devMachinesFor counts the DevMachines that still belong to a cluster.
+func (r *DevCluster) devMachinesFor(ctx context.Context, namespace, clusterName string) (int, error) {
+	devMachines := &infrav1.DevMachineList{}
+	if err := r.Client.List(ctx, devMachines,
+		client.InNamespace(namespace),
+		client.MatchingLabels{clusterv1.ClusterNameLabel: clusterName},
+	); err != nil {
+		return 0, pkgerrors.Wrapf(err, "failed to list DevMachines for Cluster %s", klog.KRef(namespace, clusterName))
+	}
+	return len(devMachines.Items), nil
 }
 
 func (r *DevCluster) backendReconcilerFactory(_ context.Context, devCluster *infrav1.DevCluster) backends.DevClusterBackendReconciler {
