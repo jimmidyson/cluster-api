@@ -401,17 +401,35 @@ func NewMulticlusterControllerManagedBy(m mcmanager.Manager, predicateLog logr.L
 	}
 }
 
-// For defines the type of Object being reconciled.
-func (blder *MulticlusterBuilder) For(object client.Object, opts ...mcbuilder.ForOption) *MulticlusterBuilder {
+// For defines the type of Object being reconciled, and the predicates that
+// filter its events.
+//
+// The predicates are variadic, where Builder takes opaque ForOptions, because
+// in wildcard mode there is no multicluster builder to hand an option to: the
+// watch is registered against the shared cache by buildWildcard, which takes
+// predicates directly. An option could only have been dropped there, silently -
+// which is what happened until a reconciler with For predicates was wired this
+// way. The topology controllers are all three of them: what makes them cheap is
+// that they see only the Clusters that have a topology and the MachineDeployments
+// and MachineSets a topology owns.
+//
+// Unlike Owns and Watches, no ResourceIsChanged predicate is prepended. This is
+// the primary watch, and Builder does not prepend one there either.
+func (blder *MulticlusterBuilder) For(object client.Object, predicates ...predicate.Predicate) *MulticlusterBuilder {
 	blder.forObject = object
 	if blder.registry != nil {
 		blder.wildcardWatches = append(blder.wildcardWatches, wildcardWatch{
-			object:  object,
-			handler: &handler.EnqueueRequestForObject{},
+			object:     object,
+			handler:    &handler.EnqueueRequestForObject{},
+			predicates: predicates,
 		})
 		return blder
 	}
-	blder.builder.For(object, opts...)
+	if len(predicates) > 0 {
+		blder.builder.For(object, mcbuilder.WithPredicates(predicates...))
+		return blder
+	}
+	blder.builder.For(object)
 	return blder
 }
 
