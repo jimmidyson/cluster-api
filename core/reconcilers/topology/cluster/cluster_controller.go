@@ -27,6 +27,7 @@ import (
 	pkgerrors "github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
@@ -75,6 +76,24 @@ import (
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;create;delete
 
+// topologyController is the part of the built controller the reconcile path uses.
+//
+// Narrowed from capicontrollerutil.Controller so that the same field can hold
+// either the single-cluster controller or the fleet-wide one. Those differ in
+// their request type - reconcile.Request against mcreconcile.Request - and so
+// have no common interface beyond the methods that do not mention it. These are
+// the only two the reconcile path calls.
+type topologyController interface {
+	// DeferNextReconcileUntilCacheUpToDate defers the next reconcile of the
+	// reconciled object until the cache has caught up with a write this
+	// reconcile made.
+	DeferNextReconcileUntilCacheUpToDate(reconciledObject metav1.Object, writtenObjectGVKT capicontrollerutil.GroupVersionKindType, writtenObjectResourceVersion string)
+
+	// ClearConsistencyStore clears the consistency store for a reconciled
+	// object, which a reconcile does when the object is gone or replaced.
+	ClearConsistencyStore(reconciledObject client.ObjectKey, reconciledObjectUID types.UID)
+}
+
 // Reconciler reconciles a managed topology for a Cluster object.
 type Reconciler struct {
 	Client       client.Client
@@ -89,7 +108,7 @@ type Reconciler struct {
 	WatchFilterValue string
 
 	externalTracker external.ObjectTracker
-	controller      capicontrollerutil.Controller
+	controller      topologyController
 	recorder        record.EventRecorder
 
 	hookCache cache.Cache[cache.HookEntry]
