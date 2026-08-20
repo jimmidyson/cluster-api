@@ -37,6 +37,7 @@ type lbCreator interface {
 // LoadBalancer manages the load balancer for a specific docker cluster.
 type LoadBalancer struct {
 	name                     string
+	logicalCluster           string
 	image                    string
 	container                *types.Node
 	ipFamily                 container.ClusterIPFamily
@@ -51,12 +52,21 @@ func NewLoadBalancer(ctx context.Context, cluster *clusterv1.Cluster, imageRepos
 		return nil, pkgerrors.New("create load balancer: cluster name is empty")
 	}
 
+	logicalCluster := logicalClusterOf(cluster)
+
 	// Look for the container that is hosting the loadbalancer for the cluster.
 	// Filter based on the label and the roles regardless of whether or not it is running.
 	// If non-running container is chosen, then it will not have an IP address associated with it.
+	//
+	// Selected by name rather than by a logical cluster label, unlike the
+	// machine containers: the load balancer is created through an interface
+	// that carries no labels, and it does not need one. Its name already
+	// carries the logical cluster and a container name is unique per daemon,
+	// which is the property that has to hold.
 	filters := container.FilterBuilder{}
 	filters.AddKeyNameValue(filterLabel, clusterLabelKey, cluster.Name)
 	filters.AddKeyNameValue(filterLabel, nodeRoleLabelKey, constants.ExternalLoadBalancerNodeRoleValue)
+	filters.AddKeyValue(filterName, fmt.Sprintf("^%s$", scopedContainerName(logicalCluster, fmt.Sprintf("%s-lb", cluster.Name))))
 
 	c, err := getContainer(ctx, filters)
 	if err != nil {
@@ -76,6 +86,7 @@ func NewLoadBalancer(ctx context.Context, cluster *clusterv1.Cluster, imageRepos
 	}
 	return &LoadBalancer{
 		name:                     cluster.Name,
+		logicalCluster:           logicalCluster,
 		image:                    image,
 		container:                c,
 		ipFamily:                 ipFamily,
@@ -99,8 +110,13 @@ func getLoadBalancerImage(imageRepository, imageTag string) string {
 }
 
 // ContainerName is the name of the docker container with the load balancer.
+//
+// Qualified by the logical cluster, because a container name is unique per
+// daemon: two workspaces whose Clusters share a name would otherwise both ask
+// for the same container, and the second would adopt the first's rather than
+// getting its own.
 func (s *LoadBalancer) containerName() string {
-	return fmt.Sprintf("%s-lb", s.name)
+	return scopedContainerName(s.logicalCluster, fmt.Sprintf("%s-lb", s.name))
 }
 
 // Create creates a docker container hosting a load balancer for the cluster.
@@ -149,8 +165,12 @@ func (s *LoadBalancer) UpdateConfiguration(ctx context.Context, weights map[stri
 	}
 
 	// collect info about the existing controlplane nodes
-	filters := container.FilterBuilder{}
-	filters.AddKeyNameValue(filterLabel, clusterLabelKey, s.name)
+	//
+	// Scoped by logical cluster: unqualified, this selects every control plane
+	// whose Cluster shares a name, so a load balancer serving one workspace
+	// would list another workspace's API servers as its backends and forward
+	// to them.
+	filters := clusterContainerFilters(s.name, s.logicalCluster)
 	filters.AddKeyNameValue(filterLabel, nodeRoleLabelKey, constants.ControlPlaneNodeRoleValue)
 
 	controlPlaneNodes, err := listContainers(ctx, filters)

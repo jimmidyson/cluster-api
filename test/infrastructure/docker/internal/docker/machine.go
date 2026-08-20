@@ -52,11 +52,12 @@ type nodeCreator interface {
 
 // Machine implement a service for managing the docker containers hosting a kubernetes nodes.
 type Machine struct {
-	cluster     string
-	machine     string
-	ipFamily    container.ClusterIPFamily
-	container   *types.Node
-	nodeCreator nodeCreator
+	cluster        string
+	logicalCluster string
+	machine        string
+	ipFamily       container.ClusterIPFamily
+	container      *types.Node
+	nodeCreator    nodeCreator
 }
 
 // NewMachine returns a new Machine service for the given Cluster/DockerCluster pair.
@@ -71,8 +72,9 @@ func NewMachine(ctx context.Context, cluster *clusterv1.Cluster, machine string,
 		return nil, pkgerrors.New("machine is required when creating a docker.Machine")
 	}
 
-	filters := container.FilterBuilder{}
-	filters.AddKeyNameValue(filterLabel, clusterLabelKey, cluster.Name)
+	logicalCluster := logicalClusterOf(cluster)
+
+	filters := clusterContainerFilters(cluster.Name, logicalCluster)
 	filters.AddKeyValue(filterName, fmt.Sprintf("^%s$", MachineContainerName(cluster.Name, machine)))
 	for key, val := range filterLabels {
 		filters.AddKeyNameValue(filterLabel, key, val)
@@ -89,11 +91,12 @@ func NewMachine(ctx context.Context, cluster *clusterv1.Cluster, machine string,
 	}
 
 	return &Machine{
-		cluster:     cluster.Name,
-		machine:     machine,
-		ipFamily:    ipFamily,
-		container:   newContainer,
-		nodeCreator: &Manager{},
+		cluster:        cluster.Name,
+		logicalCluster: logicalCluster,
+		machine:        machine,
+		ipFamily:       ipFamily,
+		container:      newContainer,
+		nodeCreator:    &Manager{},
 	}, nil
 }
 
@@ -106,8 +109,9 @@ func ListMachinesByCluster(ctx context.Context, cluster *clusterv1.Cluster, labe
 		return nil, pkgerrors.New("cluster name is required when listing machines in the cluster")
 	}
 
-	filters := container.FilterBuilder{}
-	filters.AddKeyNameValue(filterLabel, clusterLabelKey, cluster.Name)
+	logicalCluster := logicalClusterOf(cluster)
+
+	filters := clusterContainerFilters(cluster.Name, logicalCluster)
 	for key, val := range labels {
 		filters.AddKeyNameValue(filterLabel, key, val)
 	}
@@ -125,11 +129,12 @@ func ListMachinesByCluster(ctx context.Context, cluster *clusterv1.Cluster, labe
 	machines := make([]*Machine, len(containers))
 	for i, containerNode := range containers {
 		machines[i] = &Machine{
-			cluster:     cluster.Name,
-			machine:     machineFromContainerName(cluster.Name, containerNode.Name),
-			ipFamily:    ipFamily,
-			container:   containerNode,
-			nodeCreator: &Manager{},
+			cluster:        cluster.Name,
+			logicalCluster: logicalCluster,
+			machine:        machineFromContainerName(cluster.Name, containerNode.Name),
+			ipFamily:       ipFamily,
+			container:      containerNode,
+			nodeCreator:    &Manager{},
 		}
 	}
 
@@ -226,6 +231,11 @@ func (m *Machine) Create(ctx context.Context, image string, role string, version
 		}
 
 		kindMapping := kind.GetMapping(semVer, image)
+
+		// Stamp the logical cluster onto the container, because every lookup
+		// in this package selects by label and a container that does not carry
+		// it cannot be told apart from a same-named one in another workspace.
+		labels = withLogicalClusterLabel(labels, m.logicalCluster)
 
 		switch role {
 		case constants.ControlPlaneNodeRoleValue:
