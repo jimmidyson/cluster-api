@@ -32,6 +32,7 @@ import (
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	runtimev1 "sigs.k8s.io/cluster-api/api/runtime/v1beta2"
+	"sigs.k8s.io/cluster-api/controllers/clustercache"
 	"sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/cluster-api/internal/contract"
 	"sigs.k8s.io/cluster-api/util"
@@ -975,4 +976,85 @@ func TestReconcileV1Beta1ControlPlaneInitializedControlPlaneRef(t *testing.T) {
 	g.Expect(res.IsZero()).To(BeTrue())
 	g.Expect(err).ToNot(HaveOccurred())
 	g.Expect(v1beta1conditions.Has(c, clusterv1.ControlPlaneInitializedV1Beta1Condition)).To(BeFalse())
+}
+
+// TestClusterReconcilerDeletingClusterWithoutItsClusterClass covers the one
+// state in which a Cluster does not need the ClusterClass it names.
+//
+// A ClusterClass ordinarily outlives every Cluster using it, because deleting
+// one that is in use is refused - so failing the reconcile when it is missing
+// looks safe. It is not, in the case where the objects go all at once: a
+// deleted kcp APIBinding removes every bound object together, and a namespace
+// deletion has the same shape. There the Cluster and its class are deleted
+// together, and a reconcile that fails on the missing class never reaches the
+// deletion path. The Cluster keeps its finalizer, and everything owning it
+// keeps theirs, forever.
+func TestClusterReconcilerDeletingClusterWithoutItsClusterClass(t *testing.T) {
+	utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.ClusterTopology, true)
+
+	deletionTimestamp := metav1.Now()
+	newCluster := func(deleting bool) *clusterv1.Cluster {
+		cluster := builder.Cluster("test-ns", "test-cluster").
+			WithTopology(&clusterv1.Topology{ClassRef: clusterv1.ClusterClassRef{Name: "gone"}, Version: "v1.34.0"}).
+			Build()
+		cluster.Finalizers = []string{clusterv1.ClusterFinalizer}
+		if deleting {
+			cluster.DeletionTimestamp = &deletionTimestamp
+		}
+		return cluster
+	}
+
+	for _, tt := range []struct {
+		name         string
+		deleting     bool
+		wantClassErr bool
+	}{
+		{
+			name:         "a deleting Cluster proceeds without its ClusterClass",
+			deleting:     true,
+			wantClassErr: false,
+		},
+		{
+			// The other half, so that the exemption stays an exemption: a
+			// Cluster that is not being deleted cannot be reconciled without
+			// the class that says what it should look like.
+			name:         "a live Cluster still fails without its ClusterClass",
+			deleting:     false,
+			wantClassErr: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewWithT(t)
+
+			cluster := newCluster(tt.deleting)
+			fakeClient := fake.NewClientBuilder().
+				WithObjects(cluster).
+				WithStatusSubresource(&clusterv1.Cluster{}).
+				Build()
+			r := &Reconciler{
+				Client:       fakeClient,
+				APIReader:    fakeClient,
+				ClusterCache: clustercache.NewFakeClusterCache(fakeClient, client.ObjectKeyFromObject(cluster)),
+				recorder:     record.NewFakeRecorder(32),
+			}
+
+			// Twice: the first reconcile of a Cluster sets the Paused
+			// condition and returns before anything reads a ClusterClass, so a
+			// single call would pass this test without exercising it.
+			req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(cluster)}
+			_, err := r.Reconcile(ctx, req)
+			if err == nil {
+				_, err = r.Reconcile(ctx, req)
+			}
+			if tt.wantClassErr {
+				g.Expect(err).To(HaveOccurred())
+				g.Expect(err.Error()).To(ContainSubstring("failed to get ClusterClass"))
+				return
+			}
+			if err != nil {
+				g.Expect(err.Error()).ToNot(ContainSubstring("failed to get ClusterClass"),
+					"a deleting Cluster is blocked on a ClusterClass that is never coming back")
+			}
+		})
+	}
 }

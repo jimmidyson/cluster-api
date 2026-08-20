@@ -172,7 +172,24 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (retRes ct
 	if cluster.Spec.Topology.IsDefined() {
 		s.clusterClass = &clusterv1.ClusterClass{}
 		if err := r.Client.Get(ctx, cluster.GetClassKey(), s.clusterClass); err != nil {
-			return ctrl.Result{}, pkgerrors.Wrapf(err, "failed to get ClusterClass %s", cluster.GetClassKey())
+			// A Cluster that is being deleted does not need its ClusterClass,
+			// and must not wait for one that is not coming back.
+			//
+			// The only thing read from it below is the list of availability
+			// gates the Available condition summarises, and that consumer
+			// already accepts no ClusterClass at all. Failing here instead
+			// meant the deletion reconcile never ran: the Cluster kept its
+			// finalizer, and everything owning it kept theirs, forever.
+			//
+			// A ClusterClass ordinarily outlives every Cluster using it,
+			// because deleting one that is in use is refused. It does not when
+			// the objects go all at once - a deleted kcp APIBinding removes
+			// every bound object together, and a namespace deletion has the
+			// same shape.
+			if !apierrors.IsNotFound(err) || cluster.DeletionTimestamp.IsZero() {
+				return ctrl.Result{}, pkgerrors.Wrapf(err, "failed to get ClusterClass %s", cluster.GetClassKey())
+			}
+			s.clusterClass = nil
 		}
 	}
 
