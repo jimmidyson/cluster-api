@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -901,4 +902,64 @@ func apiServerEtcdClientCertificateConfig() *certs.Config {
 		Organization: []string{"system:masters"}, // TODO: check if we can drop
 		Usages:       []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}
+}
+
+// TestGetFreePortSkipsAPortInUse is the defect this check exists for.
+//
+// The port a workload cluster is given is recorded on its listener and never
+// revisited, so handing out one that something else holds does not produce a
+// retry with a different port — it produces a workload cluster whose endpoint
+// nothing answers on, permanently. Where the range is derived from a single
+// probed port, that lands on the second workload cluster and only the second.
+func TestGetFreePortSkipsAPortInUse(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	manager := inmemoryruntime.NewManager(scheme)
+	ports := getCustomPorts()
+	wcmux, err := NewWorkloadClustersMux(manager, "127.0.0.1", ports)
+	g.Expect(err).ToNot(HaveOccurred())
+	defer func() { g.Expect(wcmux.Shutdown(t.Context())).To(Succeed()) }()
+
+	// The first workload cluster's port, taken by something else — which is
+	// what a busy machine looks like to the port after the one that was
+	// probed.
+	squatter, err := net.Listen("tcp", fmt.Sprintf(":%d", ports.MinPort))
+	g.Expect(err).ToNot(HaveOccurred())
+	defer func() { _ = squatter.Close() }()
+
+	wcl, err := wcmux.InitWorkloadClusterListener("workload-cluster", 0)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(wcl.Port()).ToNot(Equal(ports.MinPort),
+		"the mux handed out a port something else is listening on, which it will then keep forever")
+
+	// And the port it did hand out is one a listener can actually take.
+	l, err := net.Listen("tcp", fmt.Sprintf(":%d", wcl.Port()))
+	g.Expect(err).ToNot(HaveOccurred(), "the port handed out could not be bound")
+	g.Expect(l.Close()).To(Succeed())
+}
+
+// TestGetFreePortExhaustsTheRange keeps the error path honest: skipping is not
+// the same as pretending, and a range with nothing free must still say so.
+func TestGetFreePortExhaustsTheRange(t *testing.T) {
+	t.Parallel()
+	g := NewWithT(t)
+
+	manager := inmemoryruntime.NewManager(scheme)
+	ports := getCustomPorts()
+	// A range of exactly two, both held.
+	ports.MaxPort = ports.MinPort + 1
+	wcmux, err := NewWorkloadClustersMux(manager, "127.0.0.1", ports)
+	g.Expect(err).ToNot(HaveOccurred())
+	defer func() { g.Expect(wcmux.Shutdown(t.Context())).To(Succeed()) }()
+
+	for port := ports.MinPort; port <= ports.MaxPort; port++ {
+		l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		g.Expect(err).ToNot(HaveOccurred())
+		defer func() { _ = l.Close() }() //nolint:gocritic // held for the test's duration on purpose.
+	}
+
+	_, err = wcmux.InitWorkloadClusterListener("workload-cluster", 0)
+	g.Expect(err).To(HaveOccurred(), "every port in the range was taken, so the mux must report that rather than hand one out")
+	g.Expect(err.Error()).To(ContainSubstring("no more free ports"))
 }

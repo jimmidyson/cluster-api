@@ -692,16 +692,41 @@ func (m *WorkloadClustersMux) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// getFreePortLocked gets a free port.
+// getFreePortLocked gets a port nothing is listening on.
 // Note: m.lock must be locked before calling this method.
+//
+// It checks, rather than counting upward and hoping, because the port it
+// returns is recorded on the WorkloadClusterListener and never revisited: the
+// listener is looked up by name from then on, so a port that turns out to be
+// taken is not retried with a different one — it is retried with the same one,
+// forever. The workload cluster then has an endpoint nothing answers on, and
+// every wait downstream of reaching it (a Node appearing, a control plane
+// initialising, a remote connection probe) waits for something that cannot
+// happen.
+//
+// That is not theoretical. Where a caller derives its range from one probed
+// port — the first workload cluster gets the port that was probed and every
+// later one gets an unprobed neighbour — this failed the second workload
+// cluster of two on a busy machine, and only the second, which is a hard
+// failure that reads exactly like slowness.
+//
+// The check is a bind, so it is not free of races: something can take the port
+// between the probe closing and the listener opening. That window is
+// microseconds and self-corrects on the next call, where "never checked at
+// all" did not.
 func (m *WorkloadClustersMux) getFreePortLocked() (int32, error) {
-	port := m.portIndex
-	if port > m.maxPort {
-		return -1, pkgerrors.Errorf("no more free ports in the %d-%d range", m.minPort, m.maxPort)
+	for port := m.portIndex; port <= m.maxPort; port++ {
+		l, err := net.Listen("tcp", fmt.Sprintf(":%d", port)) //nolint:noctx
+		if err != nil {
+			// Taken by something outside this mux. Skip it: the next caller
+			// starts after it rather than colliding with it again.
+			continue
+		}
+		if err := l.Close(); err != nil {
+			return -1, pkgerrors.Wrapf(err, "failed to release the probe listener for port %d", port)
+		}
+		m.portIndex = port + 1
+		return port, nil
 	}
-
-	// TODO: check the port is actually free. If not try the next one
-
-	m.portIndex++
-	return port, nil
+	return -1, pkgerrors.Errorf("no more free ports in the %d-%d range", m.minPort, m.maxPort)
 }
