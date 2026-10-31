@@ -160,10 +160,13 @@ func (r *Reconciler) reconcileBootstrap(ctx context.Context, s *scope) (ctrl.Res
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			s.bootstrapConfigIsNotFound = true
-			// kcp's APIBinding delete cascades all bound types at once
-			// (Machine, Cluster, KubeadmConfig, DevMachine, DevCluster, …).
-			// The Machine may still be Running while its bootstrap/infra
-			// objects have already been garbage-collected by kcp, so neither
+			// During kcp's APIBinding cascade the Machine may still be Running
+			// while its externals have already been GC'd. If it already has a
+			// finalizer, this is not initial provisioning - tolerate NotFound.
+			if controllerutil.ContainsFinalizer(m, clusterv1.MachineFinalizer) {
+				return ctrl.Result{}, nil
+			}
+			if s.cluster != nil && !s.cluster.DeletionTimestamp.IsZero() {
 			// the Machine nor the Cluster has a DeletionTimestamp yet in this
 			// cached fetch. Tolerate NotFound when the Machine was already
 			// past provisioning rather than requeueing forever and blocking
@@ -265,16 +268,10 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, s *scope) (ctr
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			s.infraMachineIsNotFound = true
-			// kcp's APIBinding delete cascades all bound types at once
-			// (Machine, Cluster, KubeadmConfig, DevMachine, DevCluster, …).
-			// The Machine may still be Running while its bootstrap/infra
-			// objects have already been garbage-collected by kcp, so neither
-			// the Machine nor the Cluster has a DeletionTimestamp yet in this
-			// cached fetch. Tolerate NotFound when the Machine was already
-			// past provisioning rather than requeueing forever and blocking
-			// teardown (kcp 0.33 exposed this more aggressively than 0.32).
-			if ptr.Deref(m.Status.Initialization.InfrastructureProvisioned, false) ||
-				ptr.Deref(m.Status.Initialization.BootstrapDataSecretCreated, false) {
+			// During kcp's APIBinding cascade the Machine may still be Running
+			// while its externals have already been GC'd. If it already has a
+			// finalizer, this is not initial provisioning - tolerate NotFound.
+			if controllerutil.ContainsFinalizer(m, clusterv1.MachineFinalizer) {
 				return ctrl.Result{}, nil
 			}
 			if s.cluster != nil && !s.cluster.DeletionTimestamp.IsZero() {
