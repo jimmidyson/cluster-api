@@ -167,15 +167,6 @@ func (r *Reconciler) reconcileBootstrap(ctx context.Context, s *scope) (ctrl.Res
 				return ctrl.Result{}, nil
 			}
 			if s.cluster != nil && !s.cluster.DeletionTimestamp.IsZero() {
-			// the Machine nor the Cluster has a DeletionTimestamp yet in this
-			// cached fetch. Tolerate NotFound when the Machine was already
-			// past provisioning rather than requeueing forever and blocking
-			// teardown (kcp 0.33 exposed this more aggressively than 0.32).
-			if ptr.Deref(m.Status.Initialization.InfrastructureProvisioned, false) ||
-				ptr.Deref(m.Status.Initialization.BootstrapDataSecretCreated, false) {
-				return ctrl.Result{}, nil
-			}
-			if s.cluster != nil && !s.cluster.DeletionTimestamp.IsZero() {
 				return ctrl.Result{}, nil
 			}
 			if !s.machine.DeletionTimestamp.IsZero() {
