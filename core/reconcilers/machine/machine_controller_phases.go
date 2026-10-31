@@ -161,8 +161,15 @@ func (r *Reconciler) reconcileBootstrap(ctx context.Context, s *scope) (ctrl.Res
 		if apierrors.IsNotFound(err) {
 			s.bootstrapConfigIsNotFound = true
 
-			if !s.machine.DeletionTimestamp.IsZero() || !s.cluster.DeletionTimestamp.IsZero() {
-				// Tolerate bootstrap object not found when the machine or its cluster is being deleted.
+			// During kcp's APIBinding cascade, bootstrap/infra objects may be
+			// deleted before Machine (or its Cluster) gets DeletionTimestamp.
+			// Tolerate not-found during teardown even before deletion is visible
+			// in this reconcile's cached fetch, to unblock deletion.
+			if s.cluster != nil && !s.cluster.DeletionTimestamp.IsZero() {
+				return ctrl.Result{}, nil
+			}
+			if !s.machine.DeletionTimestamp.IsZero() {
+				// Tolerate bootstrap object not found when the machine is being deleted.
 				// TODO: we can also relax this and tolerate the absence of the bootstrap ref way before, e.g. after node ref is set
 				return ctrl.Result{}, nil
 			}
@@ -252,13 +259,17 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, s *scope) (ctr
 		if apierrors.IsNotFound(err) {
 			s.infraMachineIsNotFound = true
 
-			if !s.machine.DeletionTimestamp.IsZero() || !s.cluster.DeletionTimestamp.IsZero() {
-				// Tolerate infra machine not found when the machine or its cluster is being deleted.
-				// kcp's APIBinding cascade can delete the infra object before the Machine gets its
-				// DeletionTimestamp (out-of-order GC), and the error below would block the delete path.
+			// During kcp's APIBinding cascade, bootstrap/infra objects may be
+			// deleted before Machine (or its Cluster) gets DeletionTimestamp.
+			// Tolerate not-found during teardown even before deletion is visible
+			// in this reconcile's cached fetch, to unblock deletion.
+			if s.cluster != nil && !s.cluster.DeletionTimestamp.IsZero() {
 				return ctrl.Result{}, nil
 			}
-
+			if !s.machine.DeletionTimestamp.IsZero() {
+				// Tolerate infra machine not found when the machine is being deleted.
+				return ctrl.Result{}, nil
+			}
 			if ptr.Deref(m.Status.Initialization.InfrastructureProvisioned, false) {
 				// Infra object went missing after the machine was up and running
 				log.Error(err, "Machine infrastructure reference has been deleted after provisioning was completed, setting failure state")
