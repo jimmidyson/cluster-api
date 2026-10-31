@@ -161,8 +161,8 @@ func (r *Reconciler) reconcileBootstrap(ctx context.Context, s *scope) (ctrl.Res
 		if apierrors.IsNotFound(err) {
 			s.bootstrapConfigIsNotFound = true
 
-			if !s.machine.DeletionTimestamp.IsZero() {
-				// Tolerate bootstrap object not found when the machine is being deleted.
+			if !s.machine.DeletionTimestamp.IsZero() || !s.cluster.DeletionTimestamp.IsZero() {
+				// Tolerate bootstrap object not found when the machine or its cluster is being deleted.
 				// TODO: we can also relax this and tolerate the absence of the bootstrap ref way before, e.g. after node ref is set
 				return ctrl.Result{}, nil
 			}
