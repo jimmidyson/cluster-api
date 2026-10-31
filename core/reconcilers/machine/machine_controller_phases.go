@@ -160,11 +160,18 @@ func (r *Reconciler) reconcileBootstrap(ctx context.Context, s *scope) (ctrl.Res
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			s.bootstrapConfigIsNotFound = true
-
-			// During kcp's APIBinding cascade, bootstrap/infra objects may be
-			// deleted before Machine (or its Cluster) gets DeletionTimestamp.
-			// Tolerate not-found during teardown even before deletion is visible
-			// in this reconcile's cached fetch, to unblock deletion.
+			// kcp's APIBinding delete cascades all bound types at once
+			// (Machine, Cluster, KubeadmConfig, DevMachine, DevCluster, …).
+			// The Machine may still be Running while its bootstrap/infra
+			// objects have already been garbage-collected by kcp, so neither
+			// the Machine nor the Cluster has a DeletionTimestamp yet in this
+			// cached fetch. Tolerate NotFound when the Machine was already
+			// past provisioning rather than requeueing forever and blocking
+			// teardown (kcp 0.33 exposed this more aggressively than 0.32).
+			if ptr.Deref(m.Status.Initialization.InfrastructureProvisioned, false) ||
+				ptr.Deref(m.Status.Initialization.BootstrapDataSecretCreated, false) {
+				return ctrl.Result{}, nil
+			}
 			if s.cluster != nil && !s.cluster.DeletionTimestamp.IsZero() {
 				return ctrl.Result{}, nil
 			}
@@ -258,11 +265,18 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, s *scope) (ctr
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			s.infraMachineIsNotFound = true
-
-			// During kcp's APIBinding cascade, bootstrap/infra objects may be
-			// deleted before Machine (or its Cluster) gets DeletionTimestamp.
-			// Tolerate not-found during teardown even before deletion is visible
-			// in this reconcile's cached fetch, to unblock deletion.
+			// kcp's APIBinding delete cascades all bound types at once
+			// (Machine, Cluster, KubeadmConfig, DevMachine, DevCluster, …).
+			// The Machine may still be Running while its bootstrap/infra
+			// objects have already been garbage-collected by kcp, so neither
+			// the Machine nor the Cluster has a DeletionTimestamp yet in this
+			// cached fetch. Tolerate NotFound when the Machine was already
+			// past provisioning rather than requeueing forever and blocking
+			// teardown (kcp 0.33 exposed this more aggressively than 0.32).
+			if ptr.Deref(m.Status.Initialization.InfrastructureProvisioned, false) ||
+				ptr.Deref(m.Status.Initialization.BootstrapDataSecretCreated, false) {
+				return ctrl.Result{}, nil
+			}
 			if s.cluster != nil && !s.cluster.DeletionTimestamp.IsZero() {
 				return ctrl.Result{}, nil
 			}
@@ -271,7 +285,6 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, s *scope) (ctr
 				return ctrl.Result{}, nil
 			}
 			if ptr.Deref(m.Status.Initialization.InfrastructureProvisioned, false) {
-				// Infra object went missing after the machine was up and running
 				log.Error(err, "Machine infrastructure reference has been deleted after provisioning was completed, setting failure state")
 				if m.Status.Deprecated == nil {
 					m.Status.Deprecated = &clusterv1.MachineDeprecatedStatus{}
