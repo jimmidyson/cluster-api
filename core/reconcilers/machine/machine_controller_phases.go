@@ -252,8 +252,10 @@ func (r *Reconciler) reconcileInfrastructure(ctx context.Context, s *scope) (ctr
 		if apierrors.IsNotFound(err) {
 			s.infraMachineIsNotFound = true
 
-			if !s.machine.DeletionTimestamp.IsZero() {
-				// Tolerate infra machine not found when the machine is being deleted.
+			if !s.machine.DeletionTimestamp.IsZero() || !s.cluster.DeletionTimestamp.IsZero() {
+				// Tolerate infra machine not found when the machine or its cluster is being deleted.
+				// kcp's APIBinding cascade can delete the infra object before the Machine gets its
+				// DeletionTimestamp (out-of-order GC), and the error below would block the delete path.
 				return ctrl.Result{}, nil
 			}
 
